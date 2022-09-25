@@ -1,0 +1,13 @@
+[package]
+name = "gambit-parser"
+version = "0.1.0"
+edition = "2021"
+description = "parser for gambit efg files"
+readme = "README.md"
+repository = "https://github.com/erikbrinkman/gambit-parser-rs"
+license = "MIT"
+keywords = ["gambit", "parser", "efg"]
+
+[dependencies]
+nom = "7"
+num = "0.4"
