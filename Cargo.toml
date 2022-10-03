@@ -9,5 +9,5 @@ license = "MIT"
 keywords = ["gambit", "parser", "efg"]
 
 [dependencies]
-nom = "7"
+nom = "7.1"
 num = "0.4"
