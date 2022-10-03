@@ -1,9 +1,9 @@
 Gambit Parser
 =============
 [![crates.io](https://img.shields.io/crates/v/gambit-parser)](https://crates.io/crates/gambit-parser)
-[![docs](https://img.shields.io/badge/docs-docs.rs-blue)](https://docs.rs/cfr/latest/gambit-parser/)
-[![build](https://github.com/erikbrinkman/gambit-parser-rs/actions/workflows/rust.yml/badge.svg)](https://github.com/erikbrinkman/gambit-parser-rs/actions/workflows/rust.yml)
+[![docs](https://docs.rs/gambit-parser/badge.svg)](https://docs.rs/gambit-parser)
 [![license](https://img.shields.io/github/license/erikbrinkman/gambit-parser-rs)](LICENSE)
+[![tests](https://github.com/erikbrinkman/gambit-parser-rs/actions/workflows/rust.yml/badge.svg)](https://github.com/erikbrinkman/gambit-parser-rs/actions/workflows/rust.yml)
 
 A rust parser for gambit [extensive form game
 (`.efg`)](https://gambitproject.readthedocs.io/en/v16.0.2/formats.html) files.
