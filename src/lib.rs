@@ -30,7 +30,8 @@ use num::rational::BigRational;
 use num::{BigInt, One, Zero};
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
-use std::fmt::{self, Display, Formatter};
+use std::error::Error as StdError;
+use std::fmt::{Display, Error as FmtError, Formatter};
 pub use unescaped::{EscapedStr, Unescaped};
 
 /// A full extensive form game
@@ -62,7 +63,7 @@ impl<'a> ExtensiveFormGame<'a> {
 
     /// Names for every player, in order
     pub fn player_names(&self) -> &[&'a EscapedStr] {
-        &*self.player_names
+        &self.player_names
     }
 
     /// An optional game comment
@@ -77,7 +78,7 @@ impl<'a> ExtensiveFormGame<'a> {
 }
 
 impl<'a> Display for ExtensiveFormGame<'a> {
-    fn fmt(&self, out: &mut Formatter<'_>) -> Result<(), fmt::Error> {
+    fn fmt(&self, out: &mut Formatter<'_>) -> Result<(), FmtError> {
         write!(out, "EFG 2 R \"{}\" {{ ", self.name.as_raw_str())?;
         for name in self.player_names.iter() {
             write!(out, "\"{}\" ", name.as_raw_str())?;
@@ -92,17 +93,30 @@ impl<'a> Display for ExtensiveFormGame<'a> {
 
 /// An error that happens while trying to turn a string into an [ExtensiveFormGame]
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Error<'a> {
     /// A problem with parsing
     ///
     /// This will show the remainder of the string where the parse error occured
-    ParseError(&'a str),
+    Parse(&'a str),
     /// A problem validating the tree after parsing
-    ValidationError(ValidationError),
+    Validation(ValidationError),
 }
+
+impl<'a> Display for Error<'a> {
+    fn fmt(&self, fmt: &mut Formatter<'_>) -> Result<(), FmtError> {
+        match self {
+            Error::Parse(rem) => write!(fmt, "error parsing game at: '{}'", rem),
+            Error::Validation(err) => write!(fmt, "invalid efg: {}", err),
+        }
+    }
+}
+
+impl<'a> StdError for Error<'a> {}
 
 /// An error that results from something invalid about the parsed extensive form game
 #[derive(Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ValidationError {
     /// The probabilities of actions associated with a chance node don't sum to one
     ChanceNotDistribution,
@@ -124,9 +138,15 @@ pub enum ValidationError {
     NoOutcomePayoffs,
 }
 
+impl Display for ValidationError {
+    fn fmt(&self, fmt: &mut Formatter<'_>) -> Result<(), FmtError> {
+        write!(fmt, "{:?}", self)
+    }
+}
+
 impl<'a> From<ValidationError> for Error<'a> {
     fn from(err: ValidationError) -> Self {
-        Error::ValidationError(err)
+        Error::Validation(err)
     }
 }
 
@@ -134,8 +154,8 @@ impl<'a> From<nom::Err<nom::error::Error<&'a str>>> for Error<'a> {
     fn from(err: nom::Err<nom::error::Error<&'a str>>) -> Self {
         match err {
             nom::Err::Incomplete(_) => panic!("internal error: incomplete parsing"),
-            nom::Err::Error(err) => Error::ParseError(err.input),
-            nom::Err::Failure(err) => Error::ParseError(err.input),
+            nom::Err::Error(err) => Error::Parse(err.input),
+            nom::Err::Failure(err) => Error::Parse(err.input),
         }
     }
 }
@@ -322,7 +342,7 @@ pub enum Node<'a> {
 }
 
 impl<'a> Display for Node<'a> {
-    fn fmt(&self, out: &mut Formatter<'_>) -> Result<(), fmt::Error> {
+    fn fmt(&self, out: &mut Formatter<'_>) -> Result<(), FmtError> {
         let mut queue = vec![self];
         while let Some(node) = queue.pop() {
             match node {
@@ -376,7 +396,7 @@ impl<'a> Chance<'a> {
 
     /// All possible outcomes with names and probabilities
     pub fn actions(&self) -> &[(&'a EscapedStr, BigRational, Node<'a>)] {
-        &*self.actions
+        &self.actions
     }
 
     /// The outcome id
@@ -394,7 +414,7 @@ impl<'a> Chance<'a> {
 }
 
 impl<'a> Display for Chance<'a> {
-    fn fmt(&self, out: &mut Formatter<'_>) -> Result<(), fmt::Error> {
+    fn fmt(&self, out: &mut Formatter<'_>) -> Result<(), FmtError> {
         write!(out, "\"{}\" {}", self.name.as_raw_str(), self.infoset)?;
         if let Some(name) = self.infoset_name {
             write!(out, " \"{}\"", name.as_raw_str())?;
@@ -457,7 +477,7 @@ impl<'a> Player<'a> {
 
     /// All the actions a player can take with names
     pub fn actions(&self) -> &[(&'a EscapedStr, Node<'a>)] {
-        &*self.actions
+        &self.actions
     }
 
     /// The outcome id
@@ -481,7 +501,7 @@ impl<'a> Player<'a> {
 }
 
 impl<'a> Display for Player<'a> {
-    fn fmt(&self, out: &mut Formatter<'_>) -> Result<(), fmt::Error> {
+    fn fmt(&self, out: &mut Formatter<'_>) -> Result<(), FmtError> {
         write!(
             out,
             "\"{}\" {} {}",
@@ -542,12 +562,12 @@ impl<'a> Terminal<'a> {
 
     /// The payoffs to every player
     pub fn outcome_payoffs(&self) -> &[BigRational] {
-        &*self.outcome_payoffs
+        &self.outcome_payoffs
     }
 }
 
 impl<'a> Display for Terminal<'a> {
-    fn fmt(&self, out: &mut Formatter<'_>) -> Result<(), fmt::Error> {
+    fn fmt(&self, out: &mut Formatter<'_>) -> Result<(), FmtError> {
         write!(out, "\"{}\" {}", self.name.as_raw_str(), self.outcome)?;
         if let Some(name) = self.outcome_name {
             write!(out, " \"{}\"", name.as_raw_str())?;
