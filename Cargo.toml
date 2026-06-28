@@ -1,13 +1,18 @@
 [package]
 name = "gambit-parser"
 version = "0.2.0"
-edition = "2021"
+edition = "2024"
+rust-version = "1.85"
 description = "parser for gambit efg files"
 readme = "README.md"
 repository = "https://github.com/erikbrinkman/gambit-parser-rs"
+documentation = "https://docs.rs/gambit-parser"
 license = "MIT"
 keywords = ["gambit", "parser", "efg"]
+categories = ["parser-implementations", "game-development"]
 
 [dependencies]
-nom = "7.1"
-num = "0.4"
+nom = "8.0"
+num-bigint = "0.4"
+num-rational = "0.4"
+num-traits = "0.2"
