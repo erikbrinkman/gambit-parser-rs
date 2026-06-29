@@ -1,36 +1,37 @@
 //! A wrapper for strings that have escape characters in them
 use std::fmt::{self, Display, Formatter};
-use std::iter::FusedIterator;
+use std::iter::{FusedIterator, Peekable};
 use std::str::Chars;
 
 /// A string with backslash escapes in it
-///
-/// This wrapper allows referencing escaped strings in the source while preventing improper use.
-/// Use [EscapedStr::as_raw_str] to access the underlying buffer, or the [Display] trait to get
-/// owned versions. Use [EscapedStr::unescape] to access a [char] iter.
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
 pub struct EscapedStr {
     escaped: str,
 }
 
 impl EscapedStr {
-    pub(crate) fn new<S: AsRef<str> + ?Sized>(escaped: &S) -> &Self {
-        let escaped = escaped.as_ref();
+    pub(crate) fn new(escaped: &str) -> &Self {
+        debug_assert!(
+            escaped
+                .match_indices('"')
+                .all(|(idx, _)| escaped[..idx].ends_with('\\')),
+            "EscapedStr must not contain an unescaped quote, got {escaped:?}"
+        );
         // SAFETY: `EscapedStr` is `#[repr(transparent)]` over `str`, so a `&str` and a
-        // `&EscapedStr` share the same layout and this reference cast is sound.
+        // `&EscapedStr` share the same layout.
         unsafe { &*(escaped as *const str as *const EscapedStr) }
     }
 
-    /// Access the underlying buffer with escape sequences in it
-    pub fn as_raw_str(&self) -> &str {
+    /// The string in its original, escaped form
+    pub fn escape(&self) -> &str {
         &self.escaped
     }
 
     /// Get an iterator over the true characters
     pub fn unescape(&self) -> Unescaped<'_> {
         Unescaped {
-            chars: self.escaped.chars(),
+            chars: self.escaped.chars().peekable(),
         }
     }
 }
@@ -44,7 +45,7 @@ impl Display for EscapedStr {
 /// An iterator over the true characters of an [EscapedStr]
 #[derive(Debug, Clone)]
 pub struct Unescaped<'a> {
-    chars: Chars<'a>,
+    chars: Peekable<Chars<'a>>,
 }
 
 impl<'a> Display for Unescaped<'a> {
@@ -60,9 +61,11 @@ impl<'a> Iterator for Unescaped<'a> {
     type Item = char;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match self.chars.next() {
-            Some('\\') => Some(self.chars.next().unwrap()),
-            chr => chr,
+        let chr = self.chars.next()?;
+        if let ('\\', Some(&'"')) = (chr, self.chars.peek()) {
+            self.chars.next()
+        } else {
+            Some(chr)
         }
     }
 
@@ -81,7 +84,14 @@ mod tests {
     #[test]
     fn test_formatting() {
         let escaped = EscapedStr::new("air \\\" quote");
-        let res = escaped.to_string();
-        assert_eq!(res, "air \" quote");
+        assert_eq!(escaped.to_string(), "air \" quote");
+    }
+
+    #[test]
+    fn unescapes_only_quotes() {
+        assert_eq!(EscapedStr::new(r#"a\"b"#).to_string(), r#"a"b"#);
+        assert_eq!(EscapedStr::new(r"a\b").to_string(), r"a\b");
+        assert_eq!(EscapedStr::new(r"a\nb").to_string(), r"a\nb");
+        assert_eq!(EscapedStr::new(r"a\\b").to_string(), r"a\\b");
     }
 }

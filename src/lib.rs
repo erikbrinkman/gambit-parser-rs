@@ -19,11 +19,11 @@ use multiset::BTreeMultiSet;
 use nom::{
     IResult, Parser,
     branch::alt,
-    bytes::complete::{escaped, tag},
+    bytes::complete::tag,
     character::complete::{char, digit0, digit1, multispace0, multispace1, none_of, one_of, u64},
-    combinator::{all_consuming, map, opt},
+    combinator::{all_consuming, map, opt, recognize},
     error::{ErrorKind, ParseError},
-    multi::separated_list1,
+    multi::{many0, separated_list1},
     sequence::{delimited, pair, preceded, separated_pair, terminated},
 };
 use num_bigint::BigInt;
@@ -80,13 +80,13 @@ impl<'a> ExtensiveFormGame<'a> {
 
 impl<'a> Display for ExtensiveFormGame<'a> {
     fn fmt(&self, out: &mut Formatter<'_>) -> Result<(), FmtError> {
-        write!(out, "EFG 2 R \"{}\" {{ ", self.name.as_raw_str())?;
+        write!(out, "EFG 2 R \"{}\" {{ ", self.name.escape())?;
         for name in self.player_names.iter() {
-            write!(out, "\"{}\" ", name.as_raw_str())?;
+            write!(out, "\"{}\" ", name.escape())?;
         }
         writeln!(out, "}}")?;
         if let Some(comment) = self.comment {
-            writeln!(out, "\"{}\"", comment)?;
+            writeln!(out, "\"{}\"", comment.escape())?;
         }
         writeln!(out, "{}", self.root)
     }
@@ -416,13 +416,13 @@ impl<'a> Chance<'a> {
 
 impl<'a> Display for Chance<'a> {
     fn fmt(&self, out: &mut Formatter<'_>) -> Result<(), FmtError> {
-        write!(out, "\"{}\" {}", self.name.as_raw_str(), self.infoset)?;
+        write!(out, "\"{}\" {}", self.name.escape(), self.infoset)?;
         if let Some(name) = self.infoset_name {
-            write!(out, " \"{}\"", name.as_raw_str())?;
+            write!(out, " \"{}\"", name.escape())?;
         }
         write!(out, " {{ ")?;
         for (action, prob, _) in self.actions.iter() {
-            write!(out, "\"{}\" {} ", action, prob)?;
+            write!(out, "\"{}\" {} ", action.escape(), prob)?;
         }
         write!(out, "}} {}", self.outcome)?;
         if let Some(payoffs) = &self.outcome_payoffs {
@@ -506,20 +506,20 @@ impl<'a> Display for Player<'a> {
         write!(
             out,
             "\"{}\" {} {}",
-            self.name.as_raw_str(),
+            self.name.escape(),
             self.player_num,
             self.infoset
         )?;
         if let Some(name) = self.infoset_name {
-            write!(out, " \"{}\"", name.as_raw_str())?;
+            write!(out, " \"{}\"", name.escape())?;
         }
         write!(out, " {{ ")?;
         for (action, _) in self.actions.iter() {
-            write!(out, "\"{}\" ", action)?;
+            write!(out, "\"{}\" ", action.escape())?;
         }
         write!(out, "}} {}", self.outcome)?;
         if let Some(name) = self.outcome_name {
-            write!(out, " \"{}\"", name.as_raw_str())?;
+            write!(out, " \"{}\"", name.escape())?;
         }
         if let Some(payoffs) = &self.outcome_payoffs {
             write!(out, " {{ ")?;
@@ -569,9 +569,9 @@ impl<'a> Terminal<'a> {
 
 impl<'a> Display for Terminal<'a> {
     fn fmt(&self, out: &mut Formatter<'_>) -> Result<(), FmtError> {
-        write!(out, "\"{}\" {}", self.name.as_raw_str(), self.outcome)?;
+        write!(out, "\"{}\" {}", self.name.escape(), self.outcome)?;
         if let Some(name) = self.outcome_name {
-            write!(out, " \"{}\"", name.as_raw_str())?;
+            write!(out, " \"{}\"", name.escape())?;
         }
         write!(out, " {{ ")?;
         for payoff in self.outcome_payoffs.iter() {
@@ -638,7 +638,9 @@ fn label(input: &str) -> IResult<&str, &EscapedStr> {
     map(
         delimited(
             char('"'),
-            alt((escaped(none_of("\\\""), '\\', one_of("\\\"")), tag(""))),
+            // the body is any mix of the `\"` escape and ordinary non-quote characters; matching
+            // `\"` first means a lone `\` is ordinary and only a `"` after a `\` is escaped
+            recognize(many0(alt((tag(r#"\""#), recognize(none_of("\"")))))),
             char('"'),
         ),
         EscapedStr::new,
@@ -936,15 +938,27 @@ mod tests {
     fn test_label() {
         let (input, label) = super::label(r#""" "#).unwrap();
         assert_eq!(input, " ");
-        assert_eq!(label.as_raw_str(), "");
+        assert_eq!(label.escape(), "");
 
         let (input, label) = super::label(r#""normal" "#).unwrap();
         assert_eq!(input, " ");
-        assert_eq!(label.as_raw_str(), "normal");
+        assert_eq!(label.escape(), "normal");
 
+        // `\"` is an escaped quote and does not close the label
         let (input, label) = super::label(r#""esca\"ped" "#).unwrap();
         assert_eq!(input, " ");
-        assert_eq!(label.as_raw_str(), "esca\\\"ped");
+        assert_eq!(label.escape(), r#"esca\"ped"#);
+
+        // a backslash before a non-quote is kept; the final `"` (preceded by `h`) closes the label
+        let (input, label) = super::label(r#""back\slash" "#).unwrap();
+        assert_eq!(input, " ");
+        assert_eq!(label.escape(), r"back\slash");
+
+        // a `\` always escapes the immediately following `"`, so a label whose closing quote is
+        // preceded by a backslash is unterminated (matching gambit)
+        assert!(super::label(r#""pair\\" "#).is_err());
+        assert!(super::label(r#""unterminated"#).is_err());
+        assert!(super::label("noquote").is_err());
     }
 
     #[test]
