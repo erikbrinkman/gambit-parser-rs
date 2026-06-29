@@ -9,17 +9,20 @@ use std::str::Chars;
 /// Use [EscapedStr::as_raw_str] to access the underlying buffer, or the [Display] trait to get
 /// owned versions. Use [EscapedStr::unescape] to access a [char] iter.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(transparent)]
 pub struct EscapedStr {
     escaped: str,
 }
 
 impl EscapedStr {
-    // NOTE this could panic if not called on a validated string
     pub(crate) fn new<S: AsRef<str> + ?Sized>(escaped: &S) -> &Self {
-        unsafe { &*(escaped.as_ref() as *const str as *const EscapedStr) }
+        let escaped = escaped.as_ref();
+        // SAFETY: `EscapedStr` is `#[repr(transparent)]` over `str`, so a `&str` and a
+        // `&EscapedStr` share the same layout and this reference cast is sound.
+        unsafe { &*(escaped as *const str as *const EscapedStr) }
     }
 
-    /// Access the underly buffer with escape sequences in it
+    /// Access the underlying buffer with escape sequences in it
     pub fn as_raw_str(&self) -> &str {
         &self.escaped
     }
@@ -65,7 +68,7 @@ impl<'a> Iterator for Unescaped<'a> {
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         let (min, max) = self.chars.size_hint();
-        ((min + 1) / 2, max)
+        (min.div_ceil(2), max)
     }
 }
 

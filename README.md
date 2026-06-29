@@ -18,7 +18,7 @@ use std::io::Read;
 
 let mut buffer = String::new();
 File::open("my path")?.read_to_string(&mut buffer)?;
-let parsed: ExtensiveFormGame<'_> = original.as_str().try_into()?;
+let parsed: ExtensiveFormGame<'_> = buffer.as_str().try_into()?;
 ```
 
 Remarks

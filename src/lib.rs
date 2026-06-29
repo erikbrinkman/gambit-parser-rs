@@ -1,7 +1,7 @@
 //! A library for parsing [gambit extensive form
 //! game](https://gambitproject.readthedocs.io/en/v16.0.2/formats.html) (`.efg`) files
 //!
-//! Ths library produces an [ExtensiveFormGame], which can then be easily used to model an
+//! This library produces an [ExtensiveFormGame], which can then be easily used to model an
 //! extensive form game.
 //!
 //! In order to minimize memory consumption, this stores references to the underlying string where
@@ -9,7 +9,7 @@
 //! have escape sequences in them in the form of [EscapedStr]s.
 //!
 //! This also tries to represent the file as it's structured, so if a name is attached to an
-//! infoset on one node, this won't propogate the name to other nodes with the same infoset.
+//! infoset on one node, this won't propagate the name to other nodes with the same infoset.
 #![warn(missing_docs)]
 
 mod multiset;
@@ -17,19 +17,20 @@ mod unescaped;
 
 use multiset::BTreeMultiSet;
 use nom::{
+    IResult, Parser,
     branch::alt,
     bytes::complete::{escaped, tag},
     character::complete::{char, digit0, digit1, multispace0, multispace1, none_of, one_of, u64},
     combinator::{all_consuming, map, opt},
     error::{ErrorKind, ParseError},
     multi::separated_list1,
-    sequence::{delimited, pair, preceded, separated_pair, terminated, tuple},
-    IResult, Parser,
+    sequence::{delimited, pair, preceded, separated_pair, terminated},
 };
-use num::rational::BigRational;
-use num::{BigInt, One, Zero};
-use std::collections::hash_map::Entry;
+use num_bigint::BigInt;
+use num_rational::BigRational;
+use num_traits::{One, Zero};
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::error::Error as StdError;
 use std::fmt::{Display, Error as FmtError, Formatter};
 pub use unescaped::{EscapedStr, Unescaped};
@@ -97,7 +98,7 @@ impl<'a> Display for ExtensiveFormGame<'a> {
 pub enum Error<'a> {
     /// A problem with parsing
     ///
-    /// This will show the remainder of the string where the parse error occured
+    /// This will show the remainder of the string where the parse error occurred
     Parse(&'a str),
     /// A problem validating the tree after parsing
     Validation(ValidationError),
@@ -120,7 +121,7 @@ impl<'a> StdError for Error<'a> {}
 pub enum ValidationError {
     /// The probabilities of actions associated with a chance node don't sum to one
     ChanceNotDistribution,
-    /// A players number wasn't between one and the number of players
+    /// A player's number wasn't between one and the number of players
     InvalidPlayerNum,
     /// An infoset had different names attached to it
     NonMatchingInfosetNames,
@@ -134,7 +135,7 @@ pub enum ValidationError {
     NonMatchingOutcomeNames,
     /// An outcome had different associated payoffs
     NonMatchingOutcomePayoffs,
-    /// An outcomes was defined without payoffs
+    /// An outcome was defined without payoffs
     NoOutcomePayoffs,
 }
 
@@ -165,7 +166,7 @@ impl<'a> ExtensiveFormGame<'a> {
     ///
     /// This is identical to `ExtensiveFormGame::try_from` or `"...".try_into()`.
     pub fn try_from_str(input: &'a str) -> Result<Self, Error<'a>> {
-        let (_, game) = all_consuming(efg)(input)?;
+        let (_, game) = all_consuming(efg).parse(input)?;
         game.validate()?;
         Ok(game)
     }
@@ -255,7 +256,7 @@ impl<'a> ExtensiveFormGame<'a> {
                 let (name, acts) = ent.get_mut();
                 match (name, infoset_name) {
                     (Some(old), Some(new)) if old != &new => {
-                        return Err(ValidationError::NonMatchingInfosetNames)
+                        return Err(ValidationError::NonMatchingInfosetNames);
                     }
                     (old @ None, Some(new)) => {
                         *old = Some(new);
@@ -381,7 +382,7 @@ impl<'a> Chance<'a> {
         self.name
     }
 
-    /// The if of the node's infoset
+    /// The id of the node's infoset
     pub fn infoset(&self) -> u64 {
         self.infoset
     }
@@ -494,7 +495,7 @@ impl<'a> Player<'a> {
 
     /// Payoffs associated with the outcome
     ///
-    /// If ommited they may be defined on another node.
+    /// If omitted they may be defined on another node.
     pub fn outcome_payoffs(&self) -> Option<&[BigRational]> {
         self.outcome_payoffs.as_deref()
     }
@@ -533,7 +534,7 @@ impl<'a> Display for Player<'a> {
 
 /// A terminal node represents the end of a game
 ///
-/// Terminal nodes simple assign payoffs to every player in the game
+/// Terminal nodes simply assign payoffs to every player in the game
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Terminal<'a> {
     name: &'a EscapedStr,
@@ -581,7 +582,7 @@ impl<'a> Display for Terminal<'a> {
 }
 
 fn negate(input: &str) -> IResult<&str, bool> {
-    let (input, res) = opt(one_of("+-"))(input)?;
+    let (input, res) = opt(one_of("+-")).parse(input)?;
     Ok((input, res == Some('-')))
 }
 
@@ -590,7 +591,7 @@ fn fail(input: &str) -> nom::Err<nom::error::Error<&str>> {
 }
 
 fn big_float(input: &str) -> IResult<&str, BigRational> {
-    let (res_input, (main_neg, (int, dec), exp)) = tuple((
+    let (res_input, (main_neg, (int, dec), exp)) = (
         negate,
         alt((
             pair(
@@ -600,7 +601,8 @@ fn big_float(input: &str) -> IResult<&str, BigRational> {
             separated_pair(digit0, char('.'), digit1),
         )),
         opt(preceded(one_of("eE"), pair(negate, digit1))),
-    ))(input)?;
+    )
+        .parse(input)?;
     let mut res = if int.is_empty() {
         BigRational::zero()
     } else {
@@ -621,7 +623,8 @@ fn big_float(input: &str) -> IResult<&str, BigRational> {
 }
 
 fn big_rational(input: &str) -> IResult<&str, BigRational> {
-    let (input, (num, denom)) = pair(big_float, opt(preceded(char('/'), big_float)))(input)?;
+    let (input, (num, denom)) =
+        pair(big_float, opt(preceded(char('/'), big_float))).parse(input)?;
     Ok((
         input,
         match denom {
@@ -639,12 +642,13 @@ fn label(input: &str) -> IResult<&str, &EscapedStr> {
             char('"'),
         ),
         EscapedStr::new,
-    )(input)
+    )
+    .parse(input)
 }
 
-fn spacelist<'a, O, E, F>(f: F) -> impl FnMut(&'a str) -> IResult<&'a str, Vec<O>, E>
+fn spacelist<'a, O, E, F>(f: F) -> impl Parser<&'a str, Output = Vec<O>, Error = E>
 where
-    F: Parser<&'a str, O, E>,
+    F: Parser<&'a str, Output = O, Error = E>,
     E: ParseError<&'a str>,
 {
     delimited(
@@ -654,9 +658,9 @@ where
     )
 }
 
-fn commalist<'a, O, E, F>(f: F) -> impl FnMut(&'a str) -> IResult<&'a str, Vec<O>, E>
+fn commalist<'a, O, E, F>(f: F) -> impl Parser<&'a str, Output = Vec<O>, Error = E>
 where
-    F: Parser<&'a str, O, E>,
+    F: Parser<&'a str, Output = O, Error = E>,
     E: ParseError<&'a str>,
 {
     delimited(
@@ -667,7 +671,7 @@ where
 }
 
 fn node(input: &str) -> IResult<&str, Node<'_>> {
-    let (input, style) = preceded(multispace1, one_of("cpt"))(input)?;
+    let (input, style) = preceded(multispace1, one_of("cpt")).parse(input)?;
     match style {
         'c' => {
             let (input, chance) = chance(input)?;
@@ -681,23 +685,24 @@ fn node(input: &str) -> IResult<&str, Node<'_>> {
             let (input, term) = terminal(input)?;
             Ok((input, Node::Terminal(term)))
         }
-        _ => panic!(),
+        // `one_of("cpt")` only ever yields one of these three characters
+        _ => unreachable!(),
     }
 }
 
 fn chance(input: &str) -> IResult<&str, Chance<'_>> {
-    let (mut input, (name, infoset, infoset_name, action_probs, outcome, outcome_payoffs)) =
-        tuple((
-            preceded(multispace1, label),
-            preceded(multispace1, u64),
-            opt(preceded(multispace1, label)),
-            preceded(
-                multispace1,
-                spacelist(separated_pair(label, multispace1, big_rational)),
-            ),
-            preceded(multispace1, u64),
-            opt(preceded(multispace1, commalist(big_rational))),
-        ))(input)?;
+    let (mut input, (name, infoset, infoset_name, action_probs, outcome, outcome_payoffs)) = (
+        preceded(multispace1, label),
+        preceded(multispace1, u64),
+        opt(preceded(multispace1, label)),
+        preceded(
+            multispace1,
+            spacelist(separated_pair(label, multispace1, big_rational)),
+        ),
+        preceded(multispace1, u64),
+        opt(preceded(multispace1, commalist(big_rational))),
+    )
+        .parse(input)?;
     let mut actions = Vec::with_capacity(action_probs.len());
     for (name, prob) in action_probs {
         let (next_inp, next) = node(input)?;
@@ -730,7 +735,7 @@ fn player(input: &str) -> IResult<&str, Player<'_>> {
             outcome_name,
             outcome_payoffs,
         ),
-    ) = tuple((
+    ) = (
         preceded(multispace1, label),
         preceded(multispace1, u64),
         preceded(multispace1, u64),
@@ -739,7 +744,8 @@ fn player(input: &str) -> IResult<&str, Player<'_>> {
         preceded(multispace1, u64),
         opt(preceded(multispace1, label)),
         opt(preceded(multispace1, commalist(big_rational))),
-    ))(input)?;
+    )
+        .parse(input)?;
     let player_num = player_num.try_into().map_err(|_| fail(input))?;
     let mut actions = Vec::with_capacity(action_names.len());
     for name in action_names {
@@ -763,12 +769,13 @@ fn player(input: &str) -> IResult<&str, Player<'_>> {
 }
 
 fn terminal(input: &str) -> IResult<&str, Terminal<'_>> {
-    let (input, (name, outcome, outcome_name, payoffs)) = tuple((
+    let (input, (name, outcome, outcome_name, payoffs)) = (
         preceded(multispace1, label),
         preceded(multispace1, u64),
         opt(preceded(multispace1, label)),
         preceded(multispace1, commalist(big_rational)),
-    ))(input)?;
+    )
+        .parse(input)?;
     Ok((
         input,
         Terminal {
@@ -781,9 +788,9 @@ fn terminal(input: &str) -> IResult<&str, Terminal<'_>> {
 }
 
 fn efg(input: &str) -> IResult<&str, ExtensiveFormGame<'_>> {
-    let (input, (name, player_names, comment, root)) = tuple((
+    let (input, (name, player_names, comment, root)) = (
         preceded(
-            tuple((
+            (
                 multispace0,
                 tag("EFG"),
                 multispace1,
@@ -791,13 +798,14 @@ fn efg(input: &str) -> IResult<&str, ExtensiveFormGame<'_>> {
                 multispace1,
                 tag("R"),
                 multispace1,
-            )),
+            ),
             label,
         ),
         preceded(multispace1, spacelist(label)),
         opt(preceded(multispace1, label)),
         terminated(node, multispace0),
-    ))(input)?;
+    )
+        .parse(input)?;
     Ok((
         input,
         ExtensiveFormGame {
@@ -812,8 +820,8 @@ fn efg(input: &str) -> IResult<&str, ExtensiveFormGame<'_>> {
 #[cfg(test)]
 mod tests {
     use super::{Chance, EscapedStr, ExtensiveFormGame, Node, Player, Terminal, ValidationError};
-    use num::rational::BigRational;
-    use num::{One, Zero};
+    use num_rational::BigRational;
+    use num_traits::{One, Zero};
 
     fn new_game<'a>(
         name: &'a str,
@@ -850,6 +858,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new_player<'a>(
         name: &'a str,
         player_num: usize,
