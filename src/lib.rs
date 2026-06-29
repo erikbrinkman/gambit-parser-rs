@@ -7,24 +7,19 @@
 //! In order to minimize memory consumption, this stores references to the underlying string where
 //! possible. One side effect is that this is a borrowed struct, and any quoted labels will still
 //! have escape sequences in them in the form of [EscapedStr]s.
-//!
-//! This also tries to represent the file as it's structured, so if a name is attached to an
-//! infoset on one node, this won't propagate the name to other nodes with the same infoset.
 #![warn(missing_docs)]
 
-mod multiset;
 mod unescaped;
 
-use multiset::BTreeMultiSet;
 use nom::{
     IResult, Parser,
     branch::alt,
     bytes::complete::tag,
     character::complete::{char, digit0, digit1, multispace0, multispace1, none_of, one_of, u64},
-    combinator::{all_consuming, map, opt, recognize},
+    combinator::{map, opt, recognize},
     error::{ErrorKind, ParseError},
     multi::{many0, separated_list1},
-    sequence::{delimited, pair, preceded, separated_pair, terminated},
+    sequence::{delimited, pair, preceded, separated_pair},
 };
 use num_bigint::BigInt;
 use num_rational::BigRational;
@@ -34,6 +29,60 @@ use std::collections::hash_map::Entry;
 use std::error::Error as StdError;
 use std::fmt::{Display, Error as FmtError, Formatter};
 pub use unescaped::{EscapedStr, Unescaped};
+
+/// A chance infoset's label paired with its ordered actions and their probabilities
+type ChanceInfoset<'a> = (&'a EscapedStr, Box<[(&'a EscapedStr, BigRational)]>);
+/// A player infoset's label paired with its ordered action labels
+type PlayerInfoset<'a> = (&'a EscapedStr, Box<[&'a EscapedStr]>);
+
+/// Every infoset seen while parsing, keyed by id. Player infosets are split per player (index =
+/// `player_num - 1`); chance is its own namespace. Each entry holds the infoset's label and ordered
+/// actions, which the tree nodes reference by id.
+#[derive(Debug, PartialEq, Clone)]
+struct Infosets<'a> {
+    player: Box<[HashMap<u64, PlayerInfoset<'a>>]>,
+    chance: HashMap<u64, ChanceInfoset<'a>>,
+}
+
+/// A node in the raw, id-referenced game tree. Infoset payloads live on the game, not here.
+#[derive(Debug, PartialEq, Clone)]
+enum RawNode<'a> {
+    Chance(RawChance<'a>),
+    Player(RawPlayer<'a>),
+    Terminal(RawTerminal<'a>),
+}
+
+#[derive(Debug, PartialEq, Clone)]
+struct RawChance<'a> {
+    name: &'a EscapedStr,
+    infoset: u64,
+    // did THIS node write the infoset block, or inherit it by omission?
+    declared: bool,
+    children: Box<[RawNode<'a>]>,
+    outcome: u64,
+    outcome_payoffs: Option<Box<[BigRational]>>,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+struct RawPlayer<'a> {
+    name: &'a EscapedStr,
+    player_num: usize,
+    infoset: u64,
+    // did THIS node write the infoset block, or inherit it by omission?
+    declared: bool,
+    children: Box<[RawNode<'a>]>,
+    outcome: u64,
+    outcome_name: Option<&'a EscapedStr>,
+    outcome_payoffs: Option<Box<[BigRational]>>,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+struct RawTerminal<'a> {
+    name: &'a EscapedStr,
+    outcome: u64,
+    outcome_name: Option<&'a EscapedStr>,
+    outcome_payoffs: Box<[BigRational]>,
+}
 
 /// A full extensive form game
 ///
@@ -53,7 +102,8 @@ pub struct ExtensiveFormGame<'a> {
     name: &'a EscapedStr,
     player_names: Box<[&'a EscapedStr]>,
     comment: Option<&'a EscapedStr>,
-    root: Node<'a>,
+    infosets: Infosets<'a>,
+    root: RawNode<'a>,
 }
 
 impl<'a> ExtensiveFormGame<'a> {
@@ -73,8 +123,16 @@ impl<'a> ExtensiveFormGame<'a> {
     }
 
     /// The root node of the game tree
-    pub fn root(&self) -> &Node<'a> {
-        &self.root
+    pub fn root<'g>(&'g self) -> Node<'a, 'g> {
+        self.wrap(&self.root)
+    }
+
+    fn wrap<'g>(&'g self, raw: &'g RawNode<'a>) -> Node<'a, 'g> {
+        match raw {
+            RawNode::Chance(raw) => Node::Chance(Chance { game: self, raw }),
+            RawNode::Player(raw) => Node::Player(Player { game: self, raw }),
+            RawNode::Terminal(raw) => Node::Terminal(Terminal { raw }),
+        }
     }
 }
 
@@ -88,7 +146,7 @@ impl<'a> Display for ExtensiveFormGame<'a> {
         if let Some(comment) = self.comment {
             writeln!(out, "\"{}\"", comment.escape())?;
         }
-        writeln!(out, "{}", self.root)
+        writeln!(out, "{}", self.root())
     }
 }
 
@@ -137,6 +195,8 @@ pub enum ValidationError {
     NonMatchingOutcomePayoffs,
     /// An outcome was defined without payoffs
     NoOutcomePayoffs,
+    /// A node omitted its action list for an infoset that was never declared
+    UndeclaredInfoset,
 }
 
 impl Display for ValidationError {
@@ -166,63 +226,49 @@ impl<'a> ExtensiveFormGame<'a> {
     ///
     /// This is identical to `ExtensiveFormGame::try_from` or `"...".try_into()`.
     pub fn try_from_str(input: &'a str) -> Result<Self, Error<'a>> {
-        let (_, game) = all_consuming(efg).parse(input)?;
+        let (rest, game) = parse_game(input)?;
+        let rest = rest.trim_start();
+        if !rest.is_empty() {
+            return Err(Error::Parse(rest));
+        }
         game.validate()?;
         Ok(game)
     }
 
+    /// Infoset consistency (matching names and actions across a shared id) and player number ranges
+    /// are enforced while parsing, so this only covers what the tree shape can't: chance
+    /// distributions and outcome agreement.
     fn validate(&self) -> Result<(), ValidationError> {
-        let num_players = self.player_names.len();
-        let mut chance_infosets = HashMap::new();
-        let mut player_infosets = vec![HashMap::new(); num_players].into_boxed_slice();
+        for (_, actions) in self.infosets.chance.values() {
+            let total: BigRational = actions.iter().map(|(_, prob)| prob).sum();
+            if total != BigRational::one() {
+                return Err(ValidationError::ChanceNotDistribution);
+            }
+        }
+
         let mut outcomes = HashMap::new();
         let mut queue = vec![&self.root];
         while let Some(node) = queue.pop() {
             match node {
-                Node::Chance(chance) => {
-                    let total: BigRational = chance.actions.iter().map(|(_, prob, _)| prob).sum();
-                    if total != BigRational::one() {
-                        return Err(ValidationError::ChanceNotDistribution);
-                    }
-
-                    Self::validate_infoset(
-                        chance.infoset,
-                        chance.infoset_name,
-                        chance.actions.iter().map(|(a, p, _)| (a, p)).collect(),
-                        &mut chance_infosets,
-                    )?;
-
+                RawNode::Chance(chance) => {
                     self.validate_outcome(
                         chance.outcome,
                         None,
                         chance.outcome_payoffs.as_deref(),
                         &mut outcomes,
                     )?;
-
-                    queue.extend(chance.actions.iter().map(|(_, _, next)| next));
+                    queue.extend(chance.children.iter());
                 }
-                Node::Player(player) => {
-                    if !(1..=num_players).contains(&player.player_num) {
-                        return Err(ValidationError::InvalidPlayerNum);
-                    }
-
-                    Self::validate_infoset(
-                        player.infoset,
-                        player.infoset_name,
-                        player.actions.iter().map(|(action, _)| action).collect(),
-                        &mut player_infosets[player.player_num - 1],
-                    )?;
-
+                RawNode::Player(player) => {
                     self.validate_outcome(
                         player.outcome,
                         player.outcome_name,
                         player.outcome_payoffs.as_deref(),
                         &mut outcomes,
                     )?;
-
-                    queue.extend(player.actions.iter().map(|(_, next)| next));
+                    queue.extend(player.children.iter());
                 }
-                Node::Terminal(term) => {
+                RawNode::Terminal(term) => {
                     self.validate_outcome(
                         term.outcome,
                         term.outcome_name,
@@ -239,35 +285,6 @@ impl<'a> ExtensiveFormGame<'a> {
             }
         }
 
-        Ok(())
-    }
-
-    fn validate_infoset<T: Eq>(
-        infoset: u64,
-        infoset_name: Option<&'a EscapedStr>,
-        actions: BTreeMultiSet<T>,
-        infosets: &mut HashMap<u64, (Option<&'a EscapedStr>, BTreeMultiSet<T>)>,
-    ) -> Result<(), ValidationError> {
-        match infosets.entry(infoset) {
-            Entry::Vacant(ent) => {
-                ent.insert((infoset_name, actions));
-            }
-            Entry::Occupied(mut ent) => {
-                let (name, acts) = ent.get_mut();
-                match (name, infoset_name) {
-                    (Some(old), Some(new)) if old != &new => {
-                        return Err(ValidationError::NonMatchingInfosetNames);
-                    }
-                    (old @ None, Some(new)) => {
-                        *old = Some(new);
-                    }
-                    _ => (),
-                };
-                if acts != &actions {
-                    return Err(ValidationError::NonMatchingInfosetActions);
-                }
-            }
-        }
         Ok(())
     }
 
@@ -332,27 +349,43 @@ impl<'a> TryFrom<&'a str> for ExtensiveFormGame<'a> {
 }
 
 /// An arbitrary node in the game tree
-#[derive(Debug, PartialEq, Clone)]
-pub enum Node<'a> {
+///
+/// A handle that pairs a node with its game so it can resolve its infoset. These are cheap to copy.
+#[derive(Clone, Copy)]
+pub enum Node<'a, 'g> {
     /// A chance node
-    Chance(Chance<'a>),
+    Chance(Chance<'a, 'g>),
     /// A player node
-    Player(Player<'a>),
+    Player(Player<'a, 'g>),
     /// A terminal node
-    Terminal(Terminal<'a>),
+    Terminal(Terminal<'a, 'g>),
 }
 
-impl<'a> Display for Node<'a> {
+impl<'a, 'g> Display for Node<'a, 'g> {
     fn fmt(&self, out: &mut Formatter<'_>) -> Result<(), FmtError> {
-        let mut queue = vec![self];
+        let mut queue = vec![*self];
         while let Some(node) = queue.pop() {
             match node {
                 Node::Chance(chance) => {
-                    queue.extend(chance.actions.iter().rev().map(|(_, _, next)| next));
+                    queue.extend(
+                        chance
+                            .raw
+                            .children
+                            .iter()
+                            .rev()
+                            .map(|c| chance.game.wrap(c)),
+                    );
                     write!(out, "\nc {}", chance)?
                 }
                 Node::Player(player) => {
-                    queue.extend(player.actions.iter().rev().map(|(_, next)| next));
+                    queue.extend(
+                        player
+                            .raw
+                            .children
+                            .iter()
+                            .rev()
+                            .map(|c| player.game.wrap(c)),
+                    );
                     write!(out, "\np {}", player)?
                 }
                 Node::Terminal(terminal) => write!(out, "\nt {}", terminal)?,
@@ -366,66 +399,97 @@ impl<'a> Display for Node<'a> {
 ///
 /// A chance node represents a point in the game where things advance randomly, or alternatively,
 /// where "nature" takes a turn.
-#[derive(Debug, PartialEq, Clone)]
-pub struct Chance<'a> {
-    name: &'a EscapedStr,
-    infoset: u64,
-    infoset_name: Option<&'a EscapedStr>,
-    actions: Box<[(&'a EscapedStr, BigRational, Node<'a>)]>,
-    outcome: u64,
-    outcome_payoffs: Option<Box<[BigRational]>>,
+#[derive(Clone, Copy)]
+pub struct Chance<'a, 'g> {
+    game: &'g ExtensiveFormGame<'a>,
+    raw: &'g RawChance<'a>,
 }
 
-impl<'a> Chance<'a> {
+impl<'a, 'g> Chance<'a, 'g> {
+    fn entry(self) -> &'g ChanceInfoset<'a> {
+        &self.game.infosets.chance[&self.raw.infoset]
+    }
+
     /// The name of the node
-    pub fn name(&self) -> &'a EscapedStr {
-        self.name
+    pub fn name(self) -> &'a EscapedStr {
+        self.raw.name
     }
 
     /// The id of the node's infoset
-    pub fn infoset(&self) -> u64 {
-        self.infoset
+    pub fn infoset(self) -> u64 {
+        self.raw.infoset
     }
 
-    /// The infoset's name
+    /// The infoset's label
+    pub fn infoset_name(self) -> &'a EscapedStr {
+        self.entry().0
+    }
+
+    /// All possible actions with their names, probabilities, and resulting nodes
+    pub fn actions(
+        self,
+    ) -> impl Iterator<Item = (&'a EscapedStr, &'g BigRational, Node<'a, 'g>)> + 'g {
+        let (_, actions) = self.entry();
+        let game = self.game;
+        actions
+            .iter()
+            .zip(self.raw.children.iter())
+            .map(move |((label, prob), child)| (*label, prob, game.wrap(child)))
+    }
+
+    /// The probability and child for the action with the given label
     ///
-    /// Note that just because this infoset doesn't have a name attached, doesn't mean that the
-    /// same id doesn't have a name attached at a different node.
-    pub fn infoset_name(&self) -> Option<&'a EscapedStr> {
-        self.infoset_name
+    /// Labels need not be unique within an infoset, so this returns the first match.
+    pub fn action(self, label: &EscapedStr) -> Option<(&'g BigRational, Node<'a, 'g>)> {
+        self.actions()
+            .find(|(name, _, _)| *name == label)
+            .map(|(_, prob, next)| (prob, next))
     }
 
-    /// All possible outcomes with names and probabilities
-    pub fn actions(&self) -> &[(&'a EscapedStr, BigRational, Node<'a>)] {
-        &self.actions
+    /// The number of actions (always at least one)
+    #[allow(clippy::len_without_is_empty)]
+    pub fn len(self) -> usize {
+        self.raw.children.len()
+    }
+
+    /// The name, probability, and child for the action at the given index
+    pub fn action_at(
+        self,
+        index: usize,
+    ) -> Option<(&'a EscapedStr, &'g BigRational, Node<'a, 'g>)> {
+        let (_, actions) = self.entry();
+        let (label, prob) = actions.get(index)?;
+        Some((*label, prob, self.game.wrap(self.raw.children.get(index)?)))
     }
 
     /// The outcome id
-    pub fn outcome(&self) -> u64 {
-        self.outcome
+    pub fn outcome(self) -> u64 {
+        self.raw.outcome
     }
 
     /// Outcome payoffs for this node
     ///
     /// Outcome payoffs are added to every players' payoffs for traversing through this node. Note
     /// that if these are missing, they be defined at another node sharing the same outcome.
-    pub fn outcome_payoffs(&self) -> Option<&[BigRational]> {
-        self.outcome_payoffs.as_deref()
+    pub fn outcome_payoffs(self) -> Option<&'g [BigRational]> {
+        self.raw.outcome_payoffs.as_deref()
     }
 }
 
-impl<'a> Display for Chance<'a> {
+impl<'a, 'g> Display for Chance<'a, 'g> {
     fn fmt(&self, out: &mut Formatter<'_>) -> Result<(), FmtError> {
-        write!(out, "\"{}\" {}", self.name.escape(), self.infoset)?;
-        if let Some(name) = self.infoset_name {
-            write!(out, " \"{}\"", name.escape())?;
+        write!(out, "\"{}\" {}", self.raw.name.escape(), self.raw.infoset)?;
+        // the label and action list are written together, or both omitted, matching the file
+        if self.raw.declared {
+            let (label, actions) = self.entry();
+            write!(out, " \"{}\" {{ ", label.escape())?;
+            for (action, prob) in actions.iter() {
+                write!(out, "\"{}\" {} ", action.escape(), prob)?;
+            }
+            write!(out, "}}")?;
         }
-        write!(out, " {{ ")?;
-        for (action, prob, _) in self.actions.iter() {
-            write!(out, "\"{}\" {} ", action.escape(), prob)?;
-        }
-        write!(out, "}} {}", self.outcome)?;
-        if let Some(payoffs) = &self.outcome_payoffs {
+        write!(out, " {}", self.raw.outcome)?;
+        if let Some(payoffs) = &self.raw.outcome_payoffs {
             write!(out, " {{ ")?;
             for payoff in payoffs.iter() {
                 write!(out, "{} ", payoff)?;
@@ -439,89 +503,114 @@ impl<'a> Display for Chance<'a> {
 /// A player node in the game tree
 ///
 /// A player node represents a place where one of the players chooses what happens next.
-#[derive(Debug, PartialEq, Clone)]
-pub struct Player<'a> {
-    name: &'a EscapedStr,
-    player_num: usize,
-    infoset: u64,
-    infoset_name: Option<&'a EscapedStr>,
-    actions: Box<[(&'a EscapedStr, Node<'a>)]>,
-    outcome: u64,
-    outcome_name: Option<&'a EscapedStr>,
-    outcome_payoffs: Option<Box<[BigRational]>>,
+#[derive(Clone, Copy)]
+pub struct Player<'a, 'g> {
+    game: &'g ExtensiveFormGame<'a>,
+    raw: &'g RawPlayer<'a>,
 }
 
-impl<'a> Player<'a> {
+impl<'a, 'g> Player<'a, 'g> {
+    fn entry(self) -> &'g PlayerInfoset<'a> {
+        &self.game.infosets.player[self.raw.player_num - 1][&self.raw.infoset]
+    }
+
     /// The name of the node
-    pub fn name(&self) -> &'a EscapedStr {
-        self.name
+    pub fn name(self) -> &'a EscapedStr {
+        self.raw.name
     }
 
     /// The player acting at this node
     ///
     /// This will always be between 1 and the number of players.
-    pub fn player_num(&self) -> usize {
-        self.player_num
+    pub fn player_num(self) -> usize {
+        self.raw.player_num
     }
 
     /// The infoset id for this node and player
-    pub fn infoset(&self) -> u64 {
-        self.infoset
+    pub fn infoset(self) -> u64 {
+        self.raw.infoset
     }
 
-    /// The infoset's name
+    /// The infoset's label
+    pub fn infoset_name(self) -> &'a EscapedStr {
+        self.entry().0
+    }
+
+    /// All the actions a player can take with their names and resulting nodes
+    pub fn actions(self) -> impl Iterator<Item = (&'a EscapedStr, Node<'a, 'g>)> + 'g {
+        let (_, labels) = self.entry();
+        let game = self.game;
+        labels
+            .iter()
+            .zip(self.raw.children.iter())
+            .map(move |(label, child)| (*label, game.wrap(child)))
+    }
+
+    /// The child reached by the action with the given label
     ///
-    /// If the name is omitted, it may be defined on a different node.
-    pub fn infoset_name(&self) -> Option<&'a EscapedStr> {
-        self.infoset_name
+    /// Labels need not be unique within an infoset, so this returns the first match.
+    pub fn action(self, label: &EscapedStr) -> Option<Node<'a, 'g>> {
+        self.actions()
+            .find(|(name, _)| *name == label)
+            .map(|(_, next)| next)
     }
 
-    /// All the actions a player can take with names
-    pub fn actions(&self) -> &[(&'a EscapedStr, Node<'a>)] {
-        &self.actions
+    /// The number of actions (always at least one)
+    #[allow(clippy::len_without_is_empty)]
+    pub fn len(self) -> usize {
+        self.raw.children.len()
+    }
+
+    /// The name and child for the action at the given index
+    pub fn action_at(self, index: usize) -> Option<(&'a EscapedStr, Node<'a, 'g>)> {
+        let (_, actions) = self.entry();
+        let &label = actions.get(index)?;
+        Some((label, self.game.wrap(self.raw.children.get(index)?)))
     }
 
     /// The outcome id
-    pub fn outcome(&self) -> u64 {
-        self.outcome
+    pub fn outcome(self) -> u64 {
+        self.raw.outcome
     }
 
     /// The name of the outcome
     ///
     /// If omitted it may still be defined on another node.
-    pub fn outcome_name(&self) -> Option<&'a EscapedStr> {
-        self.outcome_name
+    pub fn outcome_name(self) -> Option<&'a EscapedStr> {
+        self.raw.outcome_name
     }
 
     /// Payoffs associated with the outcome
     ///
     /// If omitted they may be defined on another node.
-    pub fn outcome_payoffs(&self) -> Option<&[BigRational]> {
-        self.outcome_payoffs.as_deref()
+    pub fn outcome_payoffs(self) -> Option<&'g [BigRational]> {
+        self.raw.outcome_payoffs.as_deref()
     }
 }
 
-impl<'a> Display for Player<'a> {
+impl<'a, 'g> Display for Player<'a, 'g> {
     fn fmt(&self, out: &mut Formatter<'_>) -> Result<(), FmtError> {
         write!(
             out,
             "\"{}\" {} {}",
-            self.name.escape(),
-            self.player_num,
-            self.infoset
+            self.raw.name.escape(),
+            self.raw.player_num,
+            self.raw.infoset
         )?;
-        if let Some(name) = self.infoset_name {
+        // the label and action list are written together, or both omitted, matching the file
+        if self.raw.declared {
+            let (label, actions) = self.entry();
+            write!(out, " \"{}\" {{ ", label.escape())?;
+            for action in actions.iter() {
+                write!(out, "\"{}\" ", action.escape())?;
+            }
+            write!(out, "}}")?;
+        }
+        write!(out, " {}", self.raw.outcome)?;
+        if let Some(name) = self.raw.outcome_name {
             write!(out, " \"{}\"", name.escape())?;
         }
-        write!(out, " {{ ")?;
-        for (action, _) in self.actions.iter() {
-            write!(out, "\"{}\" ", action.escape())?;
-        }
-        write!(out, "}} {}", self.outcome)?;
-        if let Some(name) = self.outcome_name {
-            write!(out, " \"{}\"", name.escape())?;
-        }
-        if let Some(payoffs) = &self.outcome_payoffs {
+        if let Some(payoffs) = &self.raw.outcome_payoffs {
             write!(out, " {{ ")?;
             for payoff in payoffs.iter() {
                 write!(out, "{} ", payoff)?;
@@ -535,46 +624,43 @@ impl<'a> Display for Player<'a> {
 /// A terminal node represents the end of a game
 ///
 /// Terminal nodes simply assign payoffs to every player in the game
-#[derive(Debug, PartialEq, Eq, Clone)]
-pub struct Terminal<'a> {
-    name: &'a EscapedStr,
-    outcome: u64,
-    outcome_name: Option<&'a EscapedStr>,
-    outcome_payoffs: Box<[BigRational]>,
+#[derive(Clone, Copy)]
+pub struct Terminal<'a, 'g> {
+    raw: &'g RawTerminal<'a>,
 }
 
-impl<'a> Terminal<'a> {
+impl<'a, 'g> Terminal<'a, 'g> {
     /// The name of this node
-    pub fn name(&self) -> &'a EscapedStr {
-        self.name
+    pub fn name(self) -> &'a EscapedStr {
+        self.raw.name
     }
 
     /// The outcome id
-    pub fn outcome(&self) -> u64 {
-        self.outcome
+    pub fn outcome(self) -> u64 {
+        self.raw.outcome
     }
 
     /// The name of this outcome
     ///
     /// Note that if omitted it may be specified on a different node with the same outcome.
-    pub fn outcome_name(&self) -> Option<&'a EscapedStr> {
-        self.outcome_name
+    pub fn outcome_name(self) -> Option<&'a EscapedStr> {
+        self.raw.outcome_name
     }
 
     /// The payoffs to every player
-    pub fn outcome_payoffs(&self) -> &[BigRational] {
-        &self.outcome_payoffs
+    pub fn outcome_payoffs(self) -> &'g [BigRational] {
+        &self.raw.outcome_payoffs
     }
 }
 
-impl<'a> Display for Terminal<'a> {
+impl<'a, 'g> Display for Terminal<'a, 'g> {
     fn fmt(&self, out: &mut Formatter<'_>) -> Result<(), FmtError> {
-        write!(out, "\"{}\" {}", self.name.escape(), self.outcome)?;
-        if let Some(name) = self.outcome_name {
+        write!(out, "\"{}\" {}", self.raw.name.escape(), self.raw.outcome)?;
+        if let Some(name) = self.raw.outcome_name {
             write!(out, " \"{}\"", name.escape())?;
         }
         write!(out, " {{ ")?;
-        for payoff in self.outcome_payoffs.iter() {
+        for payoff in self.raw.outcome_payoffs.iter() {
             write!(out, "{} ", payoff)?;
         }
         write!(out, "}}")
@@ -672,105 +758,154 @@ where
     )
 }
 
-fn node(input: &str) -> IResult<&str, Node<'_>> {
+/// Parse `count` child nodes in sequence (they follow a node, one per action)
+fn parse_children<'a>(
+    mut input: &'a str,
+    count: usize,
+    infosets: &mut Infosets<'a>,
+) -> Result<(&'a str, Box<[RawNode<'a>]>), Error<'a>> {
+    let mut children = Vec::with_capacity(count);
+    for _ in 0..count {
+        let (rest, next) = parse_node(input, infosets)?;
+        input = rest;
+        children.push(next);
+    }
+    Ok((input, children.into()))
+}
+
+/// Record or check an infoset declaration, returning whether the block was written here and the
+/// action count. A first declaration is inserted, a repeat must match exactly, an omission inherits.
+fn resolve_infoset<'a, A: PartialEq>(
+    map: &mut HashMap<u64, (&'a EscapedStr, Box<[A]>)>,
+    infoset: u64,
+    declared: Option<(&'a EscapedStr, Vec<A>)>,
+) -> Result<(bool, usize), Error<'a>> {
+    match declared {
+        Some((name, actions)) => match map.entry(infoset) {
+            // a first declaration is stored (boxed), a repeat is only compared against the stored
+            // one, so the parsed `Vec` is never boxed just to be dropped
+            Entry::Vacant(ent) => {
+                let count = actions.len();
+                ent.insert((name, actions.into()));
+                Ok((true, count))
+            }
+            Entry::Occupied(ent) => {
+                let (stored_name, stored_actions) = ent.get();
+                if *stored_name != name {
+                    Err(ValidationError::NonMatchingInfosetNames.into())
+                } else if **stored_actions != *actions {
+                    Err(ValidationError::NonMatchingInfosetActions.into())
+                } else {
+                    Ok((true, actions.len()))
+                }
+            }
+        },
+        None => {
+            let (_, actions) = map
+                .get(&infoset)
+                .ok_or(ValidationError::UndeclaredInfoset)?;
+            Ok((false, actions.len()))
+        }
+    }
+}
+
+fn parse_node<'a>(
+    input: &'a str,
+    infosets: &mut Infosets<'a>,
+) -> Result<(&'a str, RawNode<'a>), Error<'a>> {
     let (input, style) = preceded(multispace1, one_of("cpt")).parse(input)?;
     match style {
         'c' => {
-            let (input, chance) = chance(input)?;
-            Ok((input, Node::Chance(chance)))
+            let (input, chance) = parse_chance(input, infosets)?;
+            Ok((input, RawNode::Chance(chance)))
         }
         'p' => {
-            let (input, play) = player(input)?;
-            Ok((input, Node::Player(play)))
+            let (input, player) = parse_player(input, infosets)?;
+            Ok((input, RawNode::Player(player)))
         }
         't' => {
-            let (input, term) = terminal(input)?;
-            Ok((input, Node::Terminal(term)))
+            let (input, term) = parse_terminal(input)?;
+            Ok((input, RawNode::Terminal(term)))
         }
         // `one_of("cpt")` only ever yields one of these three characters
         _ => unreachable!(),
     }
 }
 
-fn chance(input: &str) -> IResult<&str, Chance<'_>> {
-    let (mut input, (name, infoset, infoset_name, action_probs, outcome, outcome_payoffs)) = (
+fn parse_chance<'a>(
+    input: &'a str,
+    infosets: &mut Infosets<'a>,
+) -> Result<(&'a str, RawChance<'a>), Error<'a>> {
+    let (input, (name, infoset, declared, outcome, outcome_payoffs)) = (
         preceded(multispace1, label),
         preceded(multispace1, u64),
-        opt(preceded(multispace1, label)),
-        preceded(
-            multispace1,
-            spacelist(separated_pair(label, multispace1, big_rational)),
-        ),
+        opt((
+            preceded(multispace1, label),
+            preceded(
+                multispace1,
+                spacelist(separated_pair(label, multispace1, big_rational)),
+            ),
+        )),
         preceded(multispace1, u64),
         opt(preceded(multispace1, commalist(big_rational))),
     )
         .parse(input)?;
-    let mut actions = Vec::with_capacity(action_probs.len());
-    for (name, prob) in action_probs {
-        let (next_inp, next) = node(input)?;
-        input = next_inp;
-        actions.push((name, prob, next));
-    }
+    let (declared, child_count) = resolve_infoset(&mut infosets.chance, infoset, declared)?;
+    let (input, children) = parse_children(input, child_count, infosets)?;
     Ok((
         input,
-        Chance {
+        RawChance {
             name,
             infoset,
-            infoset_name,
-            actions: actions.into(),
+            declared,
+            children,
             outcome,
-            outcome_payoffs: outcome_payoffs.map(|p| p.into()),
+            outcome_payoffs: outcome_payoffs.map(Into::into),
         },
     ))
 }
 
-fn player(input: &str) -> IResult<&str, Player<'_>> {
-    let (
-        mut res_input,
-        (
-            name,
-            player_num,
-            infoset,
-            infoset_name,
-            action_names,
-            outcome,
-            outcome_name,
-            outcome_payoffs,
-        ),
-    ) = (
+fn parse_player<'a>(
+    input: &'a str,
+    infosets: &mut Infosets<'a>,
+) -> Result<(&'a str, RawPlayer<'a>), Error<'a>> {
+    let (input, (name, player_num, infoset, declared, outcome, outcome_name, outcome_payoffs)) = (
         preceded(multispace1, label),
         preceded(multispace1, u64),
         preceded(multispace1, u64),
-        opt(preceded(multispace1, label)),
-        preceded(multispace1, spacelist(label)),
+        opt((
+            preceded(multispace1, label),
+            preceded(multispace1, spacelist(label)),
+        )),
         preceded(multispace1, u64),
         opt(preceded(multispace1, label)),
         opt(preceded(multispace1, commalist(big_rational))),
     )
         .parse(input)?;
-    let player_num = player_num.try_into().map_err(|_| fail(input))?;
-    let mut actions = Vec::with_capacity(action_names.len());
-    for name in action_names {
-        let (next_inp, next) = node(res_input)?;
-        res_input = next_inp;
-        actions.push((name, next));
+    let player_num: usize = player_num.try_into().map_err(|_| fail(input))?;
+    // checked here, since the per-player infoset map is indexed by it
+    if player_num == 0 || player_num > infosets.player.len() {
+        return Err(ValidationError::InvalidPlayerNum.into());
     }
+    let (declared, child_count) =
+        resolve_infoset(&mut infosets.player[player_num - 1], infoset, declared)?;
+    let (input, children) = parse_children(input, child_count, infosets)?;
     Ok((
-        res_input,
-        Player {
+        input,
+        RawPlayer {
             name,
             player_num,
             infoset,
-            infoset_name,
-            actions: actions.into(),
+            declared,
+            children,
             outcome,
             outcome_name,
-            outcome_payoffs: outcome_payoffs.map(|p| p.into()),
+            outcome_payoffs: outcome_payoffs.map(Into::into),
         },
     ))
 }
 
-fn terminal(input: &str) -> IResult<&str, Terminal<'_>> {
+fn parse_terminal(input: &str) -> IResult<&str, RawTerminal<'_>> {
     let (input, (name, outcome, outcome_name, payoffs)) = (
         preceded(multispace1, label),
         preceded(multispace1, u64),
@@ -780,7 +915,7 @@ fn terminal(input: &str) -> IResult<&str, Terminal<'_>> {
         .parse(input)?;
     Ok((
         input,
-        Terminal {
+        RawTerminal {
             name,
             outcome,
             outcome_name,
@@ -789,8 +924,8 @@ fn terminal(input: &str) -> IResult<&str, Terminal<'_>> {
     ))
 }
 
-fn efg(input: &str) -> IResult<&str, ExtensiveFormGame<'_>> {
-    let (input, (name, player_names, comment, root)) = (
+fn parse_game(input: &str) -> Result<(&str, ExtensiveFormGame<'_>), Error<'_>> {
+    let (input, (name, player_names, comment)) = (
         preceded(
             (
                 multispace0,
@@ -805,15 +940,21 @@ fn efg(input: &str) -> IResult<&str, ExtensiveFormGame<'_>> {
         ),
         preceded(multispace1, spacelist(label)),
         opt(preceded(multispace1, label)),
-        terminated(node, multispace0),
     )
         .parse(input)?;
+    let num_players = player_names.len();
+    let mut infosets = Infosets {
+        player: (0..num_players).map(|_| HashMap::new()).collect(),
+        chance: HashMap::new(),
+    };
+    let (input, root) = parse_node(input, &mut infosets)?;
     Ok((
         input,
         ExtensiveFormGame {
             name,
             player_names: player_names.into(),
             comment,
+            infosets,
             root,
         },
     ))
@@ -821,82 +962,15 @@ fn efg(input: &str) -> IResult<&str, ExtensiveFormGame<'_>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Chance, EscapedStr, ExtensiveFormGame, Node, Player, Terminal, ValidationError};
+    use super::{Error, EscapedStr, ExtensiveFormGame, Node, ValidationError};
     use num_rational::BigRational;
-    use num_traits::{One, Zero};
+    use num_traits::One;
 
-    fn new_game<'a>(
-        name: &'a str,
-        player_names: impl IntoIterator<Item = &'a str>,
-        comment: Option<&'a str>,
-        root: Node<'a>,
-    ) -> ExtensiveFormGame<'a> {
-        ExtensiveFormGame {
-            name: EscapedStr::new(name),
-            player_names: player_names.into_iter().map(EscapedStr::new).collect(),
-            comment: comment.map(EscapedStr::new),
-            root,
-        }
-    }
-
-    fn new_chance<'a>(
-        name: &'a str,
-        infoset: u64,
-        infoset_name: Option<&'a str>,
-        actions: impl IntoIterator<Item = (&'a str, BigRational, Node<'a>)>,
-        outcome: u64,
-        outcome_payoffs: Option<Box<[BigRational]>>,
-    ) -> Chance<'a> {
-        Chance {
-            name: EscapedStr::new(name),
-            infoset,
-            infoset_name: infoset_name.map(EscapedStr::new),
-            actions: actions
-                .into_iter()
-                .map(|(name, prob, node)| (EscapedStr::new(name), prob, node))
-                .collect(),
-            outcome,
-            outcome_payoffs,
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn new_player<'a>(
-        name: &'a str,
-        player_num: usize,
-        infoset: u64,
-        infoset_name: Option<&'a str>,
-        actions: impl IntoIterator<Item = (&'a str, Node<'a>)>,
-        outcome: u64,
-        outcome_name: Option<&'a str>,
-        outcome_payoffs: Option<Box<[BigRational]>>,
-    ) -> Player<'a> {
-        Player {
-            name: EscapedStr::new(name),
-            player_num,
-            infoset,
-            infoset_name: infoset_name.map(EscapedStr::new),
-            actions: actions
-                .into_iter()
-                .map(|(name, node)| (EscapedStr::new(name), node))
-                .collect(),
-            outcome,
-            outcome_name: outcome_name.map(EscapedStr::new),
-            outcome_payoffs,
-        }
-    }
-
-    fn new_terminal<'a>(
-        name: &'a str,
-        outcome: u64,
-        outcome_name: Option<&'a str>,
-        outcome_payoffs: impl Into<Box<[BigRational]>>,
-    ) -> Terminal<'a> {
-        Terminal {
-            name: EscapedStr::new(name),
-            outcome,
-            outcome_name: outcome_name.map(EscapedStr::new),
-            outcome_payoffs: outcome_payoffs.into(),
+    /// Parse a game expected to fail validation (or a parse-time infoset check) and return the error
+    fn validation_err(game: &str) -> ValidationError {
+        match ExtensiveFormGame::try_from_str(game) {
+            Err(Error::Validation(err)) => err,
+            other => panic!("expected a validation error, got {other:?}"),
         }
     }
 
@@ -962,171 +1036,6 @@ mod tests {
     }
 
     #[test]
-    fn test_terminal() {
-        let (input, term) =
-            super::terminal(r#" "name" 1 "outcome name" { 10.000000 2.000000 }"#).unwrap();
-        let expected = new_terminal(
-            "name",
-            1,
-            Some("outcome name"),
-            [
-                BigRational::from_integer(10.into()),
-                BigRational::from_integer(2.into()),
-            ],
-        );
-        assert_eq!(input, "");
-        assert_eq!(term, expected);
-        assert_eq!(expected.to_string(), r#""name" 1 "outcome name" { 10 2 }"#);
-
-        let (input, term) = super::terminal(r#" "" 2 { -1, 4/6 }"#).unwrap();
-        let expected = new_terminal(
-            "",
-            2,
-            None,
-            [
-                BigRational::from_integer((-1).into()),
-                BigRational::new(4.into(), 6.into()),
-            ],
-        );
-        assert_eq!(input, "");
-        assert_eq!(term, expected);
-        assert_eq!(expected.to_string(), r#""" 2 { -1 2/3 }"#);
-    }
-
-    #[test]
-    fn test_player() {
-        let (input, player) = super::player(
-            r#" "name" 1 2 "infoset name" { "action" } 0
-            t "" 1 { 10 }"#,
-        )
-        .unwrap();
-        let expected = new_player(
-            "name",
-            1,
-            2,
-            Some("infoset name"),
-            [(
-                "action",
-                Node::Terminal(new_terminal(
-                    "",
-                    1,
-                    None,
-                    [BigRational::from_integer(10.into())],
-                )),
-            )],
-            0,
-            None,
-            None,
-        );
-        assert_eq!(input, "");
-        assert_eq!(player, expected);
-        assert_eq!(
-            expected.to_string(),
-            r#""name" 1 2 "infoset name" { "action" } 0"#
-        );
-
-        let (input, player) = super::player(
-            r#" "" 2 3 { "" } 1 "outcome name" { -4.5, 6.7 }
-            t "" 1 { 10 }"#,
-        )
-        .unwrap();
-        let expected = new_player(
-            "",
-            2,
-            3,
-            None,
-            [(
-                "",
-                Node::Terminal(new_terminal(
-                    "",
-                    1,
-                    None,
-                    [BigRational::from_integer(10.into())],
-                )),
-            )],
-            1,
-            Some("outcome name"),
-            Some(
-                [
-                    BigRational::new((-45).into(), 10.into()),
-                    BigRational::new(67.into(), 10.into()),
-                ]
-                .into(),
-            ),
-        );
-        assert_eq!(input, "");
-        assert_eq!(player, expected);
-        assert_eq!(
-            expected.to_string(),
-            r#""" 2 3 { "" } 1 "outcome name" { -9/2 67/10 }"#
-        );
-    }
-
-    #[test]
-    fn test_chance() {
-        let (input, chance) = super::chance(
-            r#" "name" 1 "infoset name" { "action" 1/2 } 0
-            t "" 1 { 10 }"#,
-        )
-        .unwrap();
-        let expected = new_chance(
-            "name",
-            1,
-            Some("infoset name"),
-            [(
-                "action",
-                BigRational::new(1.into(), 2.into()),
-                Node::Terminal(new_terminal(
-                    "",
-                    1,
-                    None,
-                    [BigRational::from_integer(10.into())],
-                )),
-            )],
-            0,
-            None,
-        );
-        assert_eq!(input, "");
-        assert_eq!(chance, expected);
-        assert_eq!(
-            expected.to_string(),
-            r#""name" 1 "infoset name" { "action" 1/2 } 0"#
-        );
-
-        let (input, chance) = super::chance(
-            r#" "" 2 { "" 1 } 4 { 0.1, 4 }
-            t "" 1 { 10 }"#,
-        )
-        .unwrap();
-        let expected = new_chance(
-            "",
-            2,
-            None,
-            [(
-                "",
-                BigRational::from_integer(1.into()),
-                Node::Terminal(new_terminal(
-                    "",
-                    1,
-                    None,
-                    [BigRational::from_integer(10.into())],
-                )),
-            )],
-            4,
-            Some(
-                [
-                    BigRational::new(1.into(), 10.into()),
-                    BigRational::from_integer(4.into()),
-                ]
-                .into(),
-            ),
-        );
-        assert_eq!(input, "");
-        assert_eq!(chance, expected);
-        assert_eq!(expected.to_string(), r#""" 2 { "" 1 } 4 { 1/10 4 }"#);
-    }
-
-    #[test]
     fn simple_test() {
         let game_str = r#"
         EFG 2 R "General Bayes game, one stage" { "Player 1" "Player 2" }
@@ -1140,103 +1049,9 @@ mod tests {
         t "" 3 "Outcome 3" { 2.000000 4.000000 }
         t "" 4 "Outcome 4" { 4.000000 0.000000 }
         "#;
-        let (input, efg) = super::efg(game_str).unwrap();
-        let expected = new_game(
-            "General Bayes game, one stage",
-            ["Player 1", "Player 2"],
-            Some("A single stage General Bayes Game"),
-            Node::Chance(new_chance(
-                "ROOT",
-                1,
-                Some("(0,1)"),
-                [
-                    (
-                        "1G",
-                        BigRational::new(1.into(), 2.into()),
-                        Node::Player(new_player(
-                            "",
-                            1,
-                            1,
-                            Some("(1,1)"),
-                            [
-                                (
-                                    "H",
-                                    Node::Terminal(new_terminal(
-                                        "",
-                                        1,
-                                        Some("Outcome 1"),
-                                        [
-                                            BigRational::from_integer(10.into()),
-                                            BigRational::from_integer(2.into()),
-                                        ],
-                                    )),
-                                ),
-                                (
-                                    "L",
-                                    Node::Terminal(new_terminal(
-                                        "",
-                                        2,
-                                        Some("Outcome 2"),
-                                        [
-                                            BigRational::from_integer(0.into()),
-                                            BigRational::from_integer(10.into()),
-                                        ],
-                                    )),
-                                ),
-                            ],
-                            0,
-                            None,
-                            None,
-                        )),
-                    ),
-                    (
-                        "1B",
-                        BigRational::new(1.into(), 2.into()),
-                        Node::Player(new_player(
-                            "",
-                            2,
-                            1,
-                            Some("(2,1)"),
-                            [
-                                (
-                                    "h",
-                                    Node::Terminal(new_terminal(
-                                        "",
-                                        3,
-                                        Some("Outcome 3"),
-                                        [
-                                            BigRational::from_integer(2.into()),
-                                            BigRational::from_integer(4.into()),
-                                        ],
-                                    )),
-                                ),
-                                (
-                                    "l",
-                                    Node::Terminal(new_terminal(
-                                        "",
-                                        4,
-                                        Some("Outcome 4"),
-                                        [
-                                            BigRational::from_integer(4.into()),
-                                            BigRational::from_integer(0.into()),
-                                        ],
-                                    )),
-                                ),
-                            ],
-                            0,
-                            None,
-                            None,
-                        )),
-                    ),
-                ],
-                0,
-                None,
-            )),
-        );
-        assert_eq!(input, "");
-        assert_eq!(efg, expected);
+        let game = ExtensiveFormGame::try_from_str(game_str).unwrap();
         assert_eq!(
-            expected.to_string(),
+            game.to_string(),
             r#"EFG 2 R "General Bayes game, one stage" { "Player 1" "Player 2" }
 "A single stage General Bayes Game"
 
@@ -1249,270 +1064,235 @@ t "" 3 "Outcome 3" { 2 4 }
 t "" 4 "Outcome 4" { 4 0 }
 "#
         );
+
+        // spot-check a few handle accessors
+        assert_eq!(game.name().to_string(), "General Bayes game, one stage");
+        assert_eq!(game.player_names().len(), 2);
+        let Node::Chance(root) = game.root() else {
+            panic!("expected a chance root");
+        };
+        let labels: Vec<_> = root.actions().map(|(label, _, _)| label.escape()).collect();
+        assert_eq!(labels, ["1G", "1B"]);
     }
 
-    fn empty_game<'a>(
-        player_names: impl IntoIterator<Item = &'a str>,
-        root: Node<'a>,
-    ) -> ExtensiveFormGame<'a> {
-        ExtensiveFormGame {
-            name: EscapedStr::new(""),
-            player_names: player_names.into_iter().map(EscapedStr::new).collect(),
-            comment: None,
-            root,
-        }
+    #[test]
+    fn navigates_handles() {
+        let game_str = r#"EFG 2 R "g" { "Player 1" "Player 2" }
+p "root" 1 1 "iset" { "L" "R" } 0
+t "tl" 1 "o1" { 1 2 }
+t "tr" 2 "o2" { 3 4 }
+"#;
+        let game = ExtensiveFormGame::try_from_str(game_str).unwrap();
+        let Node::Player(root) = game.root() else {
+            panic!("expected a player root");
+        };
+        assert_eq!(root.player_num(), 1);
+        assert_eq!(root.infoset(), 1);
+        assert_eq!(root.infoset_name().escape(), "iset");
+        let labels: Vec<_> = root.actions().map(|(label, _)| label.escape()).collect();
+        assert_eq!(labels, ["L", "R"]);
+
+        let Some(Node::Terminal(left)) = root.action(EscapedStr::new("L")) else {
+            panic!("expected a terminal after action L");
+        };
+        assert_eq!(left.name().escape(), "tl");
+        assert_eq!(left.outcome(), 1);
+        assert_eq!(left.outcome_name().map(EscapedStr::escape), Some("o1"));
+        let payoffs: Vec<_> = left
+            .outcome_payoffs()
+            .iter()
+            .map(BigRational::to_string)
+            .collect();
+        assert_eq!(payoffs, ["1", "2"]);
     }
 
     #[test]
     fn not_distribution() {
-        let game = empty_game(
-            ["1", "2"],
-            Node::Chance(new_chance(
-                "",
-                1,
-                None,
-                [(
-                    "",
-                    BigRational::new(9.into(), 10.into()),
-                    Node::Terminal(new_terminal("", 1, None, vec![BigRational::zero(); 2])),
-                )],
-                0,
-                None,
-            )),
-        );
         assert_eq!(
-            game.validate().unwrap_err(),
+            validation_err(
+                "EFG 2 R \"\" { \"1\" \"2\" }
+c \"\" 1 \"a\" { \"x\" 9/10 } 0
+t \"\" 1 { 0 0 }
+"
+            ),
             ValidationError::ChanceNotDistribution
         );
     }
 
     #[test]
     fn invalid_player_num() {
-        let game = empty_game(
-            ["1", "2"],
-            Node::Player(new_player("", 3, 1, None, [], 0, None, None)),
-        );
+        // a player number above the player count is rejected at parse time
         assert_eq!(
-            game.validate().unwrap_err(),
+            validation_err(
+                "EFG 2 R \"\" { \"1\" \"2\" }
+p \"\" 3 1 \"a\" { \"x\" } 0
+t \"\" 1 { 0 0 }
+"
+            ),
             ValidationError::InvalidPlayerNum
         );
     }
 
     #[test]
     fn invalid_infoset_names() {
-        let game = empty_game(
-            ["1", "2"],
-            Node::Player(new_player(
-                "",
-                1,
-                1,
-                Some("a"),
-                [(
-                    "",
-                    Node::Player(new_player("", 1, 1, Some("b"), [], 0, None, None)),
-                )],
-                0,
-                None,
-                None,
-            )),
-        );
         assert_eq!(
-            game.validate().unwrap_err(),
+            validation_err(
+                "EFG 2 R \"\" { \"1\" \"2\" }
+p \"\" 1 1 \"a\" { \"x\" } 0
+p \"\" 1 1 \"b\" { \"x\" } 0
+t \"\" 1 { 0 0 }
+"
+            ),
             ValidationError::NonMatchingInfosetNames
         );
     }
 
     #[test]
     fn invalid_chance_infoset_names() {
-        let game = empty_game(
-            ["1", "2"],
-            Node::Chance(new_chance(
-                "",
-                1,
-                Some("a"),
-                [(
-                    "",
-                    BigRational::one(),
-                    Node::Chance(new_chance(
-                        "",
-                        1,
-                        Some("b"),
-                        [(
-                            "",
-                            BigRational::one(),
-                            Node::Terminal(new_terminal("", 1, None, vec![BigRational::zero(); 2])),
-                        )],
-                        0,
-                        None,
-                    )),
-                )],
-                0,
-                None,
-            )),
-        );
         assert_eq!(
-            game.validate().unwrap_err(),
+            validation_err(
+                "EFG 2 R \"\" { \"1\" \"2\" }
+c \"\" 1 \"a\" { \"x\" 1 } 0
+c \"\" 1 \"b\" { \"x\" 1 } 0
+t \"\" 1 { 0 0 }
+"
+            ),
             ValidationError::NonMatchingInfosetNames
         );
     }
 
     #[test]
     fn invalid_infoset_actions() {
-        let game = empty_game(
-            ["1", "2"],
-            Node::Player(new_player(
-                "",
-                1,
-                1,
-                None,
-                [(
-                    "",
-                    Node::Player(new_player("", 1, 1, None, [], 0, None, None)),
-                )],
-                0,
-                None,
-                None,
-            )),
-        );
+        // a reordered list no longer matches the first declaration, since order is significant
         assert_eq!(
-            game.validate().unwrap_err(),
+            validation_err(
+                "EFG 2 R \"\" { \"1\" \"2\" }
+p \"\" 1 1 \"a\" { \"L\" \"R\" } 0
+t \"\" 1 { 0 0 }
+p \"\" 1 1 \"a\" { \"R\" \"L\" } 0
+t \"\" 2 { 0 0 }
+t \"\" 3 { 0 0 }
+"
+            ),
             ValidationError::NonMatchingInfosetActions
         );
     }
 
     #[test]
     fn invalid_chance_infoset_actions() {
-        let game = empty_game(
-            ["1", "2"],
-            Node::Chance(new_chance(
-                "",
-                1,
-                None,
-                [(
-                    "",
-                    BigRational::one(),
-                    Node::Chance(new_chance(
-                        "",
-                        1,
-                        None,
-                        [(
-                            "a",
-                            BigRational::one(),
-                            Node::Terminal(new_terminal("", 0, None, vec![BigRational::zero(); 2])),
-                        )],
-                        0,
-                        None,
-                    )),
-                )],
-                0,
-                None,
-            )),
-        );
         assert_eq!(
-            game.validate().unwrap_err(),
+            validation_err(
+                "EFG 2 R \"\" { \"1\" \"2\" }
+c \"\" 1 \"a\" { \"x\" 1 } 0
+c \"\" 1 \"a\" { \"y\" 1 } 0
+t \"\" 1 { 0 0 }
+"
+            ),
             ValidationError::NonMatchingInfosetActions
         );
     }
 
     #[test]
     fn null_outcome_payoffs() {
-        let game = empty_game(
-            ["1", "2"],
-            Node::Player(new_player(
-                "",
-                1,
-                1,
-                None,
-                [],
-                0,
-                None,
-                Some(vec![BigRational::zero(); 2].into()),
-            )),
-        );
         assert_eq!(
-            game.validate().unwrap_err(),
+            validation_err(
+                "EFG 2 R \"\" { \"1\" \"2\" }
+p \"\" 1 1 \"a\" { \"x\" } 0 { 0 0 }
+t \"\" 1 { 0 0 }
+"
+            ),
             ValidationError::NullOutcomePayoffs
         );
     }
 
     #[test]
     fn invalid_payoff_number() {
-        let game = empty_game(
-            ["1", "2"],
-            Node::Terminal(new_terminal("", 1, None, [BigRational::zero()])),
-        );
         assert_eq!(
-            game.validate().unwrap_err(),
+            validation_err(
+                "EFG 2 R \"\" { \"1\" \"2\" }
+t \"\" 1 { 0 }
+"
+            ),
             ValidationError::InvalidNumberOfPayoffs
         );
     }
 
     #[test]
     fn non_matching_outcome_names() {
-        let game = empty_game(
-            ["1", "2"],
-            Node::Player(new_player(
-                "",
-                1,
-                1,
-                None,
-                [(
-                    "",
-                    Node::Player(new_player("", 1, 2, None, [], 1, Some("a"), None)),
-                )],
-                1,
-                Some("b"),
-                None,
-            )),
-        );
         assert_eq!(
-            game.validate().unwrap_err(),
+            validation_err(
+                "EFG 2 R \"\" { \"1\" \"2\" }
+p \"\" 1 1 \"a\" { \"x\" } 1 \"b\" { 0 0 }
+t \"\" 1 \"c\" { 0 0 }
+"
+            ),
             ValidationError::NonMatchingOutcomeNames
         );
     }
 
     #[test]
     fn non_matching_outcome_payoffs() {
-        let game = empty_game(
-            ["1", "2"],
-            Node::Player(new_player(
-                "",
-                1,
-                1,
-                None,
-                [(
-                    "",
-                    Node::Player(new_player(
-                        "",
-                        1,
-                        2,
-                        None,
-                        [],
-                        1,
-                        None,
-                        Some(vec![BigRational::one(); 2].into()),
-                    )),
-                )],
-                1,
-                None,
-                Some(vec![BigRational::zero(); 2].into()),
-            )),
-        );
         assert_eq!(
-            game.validate().unwrap_err(),
+            validation_err(
+                "EFG 2 R \"\" { \"1\" \"2\" }
+p \"\" 1 1 \"a\" { \"x\" } 1 { 0 0 }
+t \"\" 1 { 1 1 }
+"
+            ),
             ValidationError::NonMatchingOutcomePayoffs
         );
     }
 
     #[test]
     fn no_outcome_payoffs() {
-        let game = empty_game(
-            ["1", "2"],
-            Node::Player(new_player("", 1, 1, None, [], 1, None, None)),
-        );
         assert_eq!(
-            game.validate().unwrap_err(),
+            validation_err(
+                "EFG 2 R \"\" { \"1\" \"2\" }
+p \"\" 1 1 \"a\" { \"x\" } 1
+t \"\" 2 { 0 0 }
+"
+            ),
             ValidationError::NoOutcomePayoffs
         );
+    }
+
+    #[test]
+    fn undeclared_infoset() {
+        // omitting the action list before the infoset has ever been declared is an error
+        assert_eq!(
+            validation_err(
+                "EFG 2 R \"\" { \"1\" \"2\" }
+p \"\" 1 1 0
+t \"\" 1 { 0 0 }
+"
+            ),
+            ValidationError::UndeclaredInfoset
+        );
+    }
+
+    #[test]
+    fn fills_omitted_action_list() {
+        let game_str = "EFG 2 R \"\" { \"1\" \"2\" }
+p \"\" 1 1 \"a\" { \"L\" \"R\" } 0
+t \"\" 1 { 0 0 }
+p \"\" 1 1 0
+t \"\" 2 { 0 0 }
+t \"\" 3 { 0 0 }
+";
+        let game = ExtensiveFormGame::try_from_str(game_str).unwrap();
+        let Node::Player(root) = game.root() else {
+            panic!("expected a player root");
+        };
+        let Some(Node::Player(omitted)) = root.action(EscapedStr::new("R")) else {
+            panic!("expected a player after action R");
+        };
+        // the omitted node inherits the declared label and actions
+        assert_eq!(omitted.infoset_name().escape(), "a");
+        let labels: Vec<_> = omitted.actions().map(|(label, _)| label.escape()).collect();
+        assert_eq!(labels, ["L", "R"]);
+        // and the omitted form round-trips (the omission is preserved)
+        let written = game.to_string();
+        let reparsed = ExtensiveFormGame::try_from_str(written.as_str()).unwrap();
+        assert_eq!(game, reparsed);
     }
 }
