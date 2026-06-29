@@ -24,11 +24,8 @@ let parsed: ExtensiveFormGame<'_> = buffer.as_str().try_into()?;
 Remarks
 -------
 
-The gambit spec says that the list of actions in chance and player nodes is
-technically optional. For this to be optional, they would need to be defined
-for the same infoset in the same file. Handling this case is slightly more
-difficult and not well documented. Since I couldn't find any examples of a
-file like this, this specific omission isn't handled.
+Gambit's reader duplicates runs of backslashes when reading a quoted label;
+this parser does not reproduce that bug.
 
 To Do
 -----
