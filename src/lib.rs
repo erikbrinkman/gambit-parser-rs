@@ -1,13 +1,13 @@
 //! A library for parsing [gambit extensive form
 //! game](https://gambitproject.readthedocs.io/en/v16.0.2/formats.html) (`.efg`) files
 //!
-//! This library produces an [ExtensiveFormGame], which can then be easily used to model an
+//! This library produces an [`ExtensiveFormGame`], which can then be easily used to model an
 //! extensive form game.
 //!
 //! In order to minimize memory consumption, this stores references to the underlying string where
 //! possible. One side effect is that this is a borrowed struct, and any quoted labels will still
-//! have escape sequences in them in the form of [EscapedStr]s.
-#![warn(missing_docs)]
+//! have escape sequences in them in the form of [`EscapedStr`]s.
+#![warn(missing_docs, clippy::pedantic)]
 
 mod unescaped;
 
@@ -86,8 +86,8 @@ struct RawTerminal<'a> {
 
 /// A full extensive form game
 ///
-/// This can be parsed from a [str] reference using [ExtensiveFormGame::try_from_str] or using the
-/// [TryFrom] / [TryInto] traits. It implements [Display] for formatting.
+/// This can be parsed from a [str] reference using [`ExtensiveFormGame::try_from_str`] or using the
+/// [`TryFrom`] / [`TryInto`] traits. It implements [Display] for formatting.
 ///
 /// # Example
 ///
@@ -108,21 +108,25 @@ pub struct ExtensiveFormGame<'a> {
 
 impl<'a> ExtensiveFormGame<'a> {
     /// The name of the game
+    #[must_use]
     pub fn name(&self) -> &'a EscapedStr {
         self.name
     }
 
     /// Names for every player, in order
+    #[must_use]
     pub fn player_names(&self) -> &[&'a EscapedStr] {
         &self.player_names
     }
 
     /// An optional game comment
+    #[must_use]
     pub fn comment(&self) -> Option<&'a EscapedStr> {
         self.comment
     }
 
     /// The root node of the game tree
+    #[must_use]
     pub fn root<'g>(&'g self) -> Node<'a, 'g> {
         self.wrap(&self.root)
     }
@@ -136,10 +140,10 @@ impl<'a> ExtensiveFormGame<'a> {
     }
 }
 
-impl<'a> Display for ExtensiveFormGame<'a> {
+impl Display for ExtensiveFormGame<'_> {
     fn fmt(&self, out: &mut Formatter<'_>) -> Result<(), FmtError> {
         write!(out, "EFG 2 R \"{}\" {{ ", self.name.escape())?;
-        for name in self.player_names.iter() {
+        for name in &self.player_names {
             write!(out, "\"{}\" ", name.escape())?;
         }
         writeln!(out, "}}")?;
@@ -150,7 +154,7 @@ impl<'a> Display for ExtensiveFormGame<'a> {
     }
 }
 
-/// An error that happens while trying to turn a string into an [ExtensiveFormGame]
+/// An error that happens while trying to turn a string into an [`ExtensiveFormGame`]
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error<'a> {
@@ -162,16 +166,16 @@ pub enum Error<'a> {
     Validation(ValidationError),
 }
 
-impl<'a> Display for Error<'a> {
+impl Display for Error<'_> {
     fn fmt(&self, fmt: &mut Formatter<'_>) -> Result<(), FmtError> {
         match self {
-            Error::Parse(rem) => write!(fmt, "error parsing game at: '{}'", rem),
-            Error::Validation(err) => write!(fmt, "invalid efg: {}", err),
+            Error::Parse(rem) => write!(fmt, "error parsing game at: '{rem}'"),
+            Error::Validation(err) => write!(fmt, "invalid efg: {err}"),
         }
     }
 }
 
-impl<'a> StdError for Error<'a> {}
+impl StdError for Error<'_> {}
 
 /// An error that results from something invalid about the parsed extensive form game
 #[derive(Debug, PartialEq, Eq)]
@@ -201,11 +205,11 @@ pub enum ValidationError {
 
 impl Display for ValidationError {
     fn fmt(&self, fmt: &mut Formatter<'_>) -> Result<(), FmtError> {
-        write!(fmt, "{:?}", self)
+        write!(fmt, "{self:?}")
     }
 }
 
-impl<'a> From<ValidationError> for Error<'a> {
+impl From<ValidationError> for Error<'_> {
     fn from(err: ValidationError) -> Self {
         Error::Validation(err)
     }
@@ -215,8 +219,7 @@ impl<'a> From<nom::Err<nom::error::Error<&'a str>>> for Error<'a> {
     fn from(err: nom::Err<nom::error::Error<&'a str>>) -> Self {
         match err {
             nom::Err::Incomplete(_) => panic!("internal error: incomplete parsing"),
-            nom::Err::Error(err) => Error::Parse(err.input),
-            nom::Err::Failure(err) => Error::Parse(err.input),
+            nom::Err::Error(err) | nom::Err::Failure(err) => Error::Parse(err.input),
         }
     }
 }
@@ -225,6 +228,10 @@ impl<'a> ExtensiveFormGame<'a> {
     /// Try to parse a game from a string
     ///
     /// This is identical to `ExtensiveFormGame::try_from` or `"...".try_into()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if the input isn't a syntactically valid and self-consistent game.
     pub fn try_from_str(input: &'a str) -> Result<Self, Error<'a>> {
         let (rest, game) = parse_game(input)?;
         let rest = rest.trim_start();
@@ -323,7 +330,7 @@ impl<'a> ExtensiveFormGame<'a> {
                             *old = Some(new);
                         }
                         _ => (),
-                    };
+                    }
                     match (payoffs, outcome_payoffs) {
                         (Some(old), Some(new)) if old != &new => {
                             return Err(ValidationError::NonMatchingOutcomePayoffs);
@@ -361,7 +368,7 @@ pub enum Node<'a, 'g> {
     Terminal(Terminal<'a, 'g>),
 }
 
-impl<'a, 'g> Display for Node<'a, 'g> {
+impl Display for Node<'_, '_> {
     fn fmt(&self, out: &mut Formatter<'_>) -> Result<(), FmtError> {
         let mut queue = vec![*self];
         while let Some(node) = queue.pop() {
@@ -375,7 +382,7 @@ impl<'a, 'g> Display for Node<'a, 'g> {
                             .rev()
                             .map(|c| chance.game.wrap(c)),
                     );
-                    write!(out, "\nc {}", chance)?
+                    write!(out, "\nc {chance}")?;
                 }
                 Node::Player(player) => {
                     queue.extend(
@@ -386,9 +393,9 @@ impl<'a, 'g> Display for Node<'a, 'g> {
                             .rev()
                             .map(|c| player.game.wrap(c)),
                     );
-                    write!(out, "\np {}", player)?
+                    write!(out, "\np {player}")?;
                 }
-                Node::Terminal(terminal) => write!(out, "\nt {}", terminal)?,
+                Node::Terminal(terminal) => write!(out, "\nt {terminal}")?,
             }
         }
         Ok(())
@@ -411,16 +418,19 @@ impl<'a, 'g> Chance<'a, 'g> {
     }
 
     /// The name of the node
+    #[must_use]
     pub fn name(self) -> &'a EscapedStr {
         self.raw.name
     }
 
     /// The id of the node's infoset
+    #[must_use]
     pub fn infoset(self) -> u64 {
         self.raw.infoset
     }
 
     /// The infoset's label
+    #[must_use]
     pub fn infoset_name(self) -> &'a EscapedStr {
         self.entry().0
     }
@@ -440,6 +450,7 @@ impl<'a, 'g> Chance<'a, 'g> {
     /// The probability and child for the action with the given label
     ///
     /// Labels need not be unique within an infoset, so this returns the first match.
+    #[must_use]
     pub fn action(self, label: &EscapedStr) -> Option<(&'g BigRational, Node<'a, 'g>)> {
         self.actions()
             .find(|(name, _, _)| *name == label)
@@ -448,11 +459,13 @@ impl<'a, 'g> Chance<'a, 'g> {
 
     /// The number of actions (always at least one)
     #[allow(clippy::len_without_is_empty)]
+    #[must_use]
     pub fn len(self) -> usize {
         self.raw.children.len()
     }
 
     /// The name, probability, and child for the action at the given index
+    #[must_use]
     pub fn action_at(
         self,
         index: usize,
@@ -463,6 +476,7 @@ impl<'a, 'g> Chance<'a, 'g> {
     }
 
     /// The outcome id
+    #[must_use]
     pub fn outcome(self) -> u64 {
         self.raw.outcome
     }
@@ -471,19 +485,20 @@ impl<'a, 'g> Chance<'a, 'g> {
     ///
     /// Outcome payoffs are added to every players' payoffs for traversing through this node. Note
     /// that if these are missing, they be defined at another node sharing the same outcome.
+    #[must_use]
     pub fn outcome_payoffs(self) -> Option<&'g [BigRational]> {
         self.raw.outcome_payoffs.as_deref()
     }
 }
 
-impl<'a, 'g> Display for Chance<'a, 'g> {
+impl Display for Chance<'_, '_> {
     fn fmt(&self, out: &mut Formatter<'_>) -> Result<(), FmtError> {
         write!(out, "\"{}\" {}", self.raw.name.escape(), self.raw.infoset)?;
         // the label and action list are written together, or both omitted, matching the file
         if self.raw.declared {
             let (label, actions) = self.entry();
             write!(out, " \"{}\" {{ ", label.escape())?;
-            for (action, prob) in actions.iter() {
+            for (action, prob) in actions {
                 write!(out, "\"{}\" {} ", action.escape(), prob)?;
             }
             write!(out, "}}")?;
@@ -491,8 +506,8 @@ impl<'a, 'g> Display for Chance<'a, 'g> {
         write!(out, " {}", self.raw.outcome)?;
         if let Some(payoffs) = &self.raw.outcome_payoffs {
             write!(out, " {{ ")?;
-            for payoff in payoffs.iter() {
-                write!(out, "{} ", payoff)?;
+            for payoff in payoffs {
+                write!(out, "{payoff} ")?;
             }
             write!(out, "}}")?;
         }
@@ -515,6 +530,7 @@ impl<'a, 'g> Player<'a, 'g> {
     }
 
     /// The name of the node
+    #[must_use]
     pub fn name(self) -> &'a EscapedStr {
         self.raw.name
     }
@@ -522,16 +538,19 @@ impl<'a, 'g> Player<'a, 'g> {
     /// The player acting at this node
     ///
     /// This will always be between 1 and the number of players.
+    #[must_use]
     pub fn player_num(self) -> usize {
         self.raw.player_num
     }
 
     /// The infoset id for this node and player
+    #[must_use]
     pub fn infoset(self) -> u64 {
         self.raw.infoset
     }
 
     /// The infoset's label
+    #[must_use]
     pub fn infoset_name(self) -> &'a EscapedStr {
         self.entry().0
     }
@@ -549,6 +568,7 @@ impl<'a, 'g> Player<'a, 'g> {
     /// The child reached by the action with the given label
     ///
     /// Labels need not be unique within an infoset, so this returns the first match.
+    #[must_use]
     pub fn action(self, label: &EscapedStr) -> Option<Node<'a, 'g>> {
         self.actions()
             .find(|(name, _)| *name == label)
@@ -557,11 +577,13 @@ impl<'a, 'g> Player<'a, 'g> {
 
     /// The number of actions (always at least one)
     #[allow(clippy::len_without_is_empty)]
+    #[must_use]
     pub fn len(self) -> usize {
         self.raw.children.len()
     }
 
     /// The name and child for the action at the given index
+    #[must_use]
     pub fn action_at(self, index: usize) -> Option<(&'a EscapedStr, Node<'a, 'g>)> {
         let (_, actions) = self.entry();
         let &label = actions.get(index)?;
@@ -569,6 +591,7 @@ impl<'a, 'g> Player<'a, 'g> {
     }
 
     /// The outcome id
+    #[must_use]
     pub fn outcome(self) -> u64 {
         self.raw.outcome
     }
@@ -576,6 +599,7 @@ impl<'a, 'g> Player<'a, 'g> {
     /// The name of the outcome
     ///
     /// If omitted it may still be defined on another node.
+    #[must_use]
     pub fn outcome_name(self) -> Option<&'a EscapedStr> {
         self.raw.outcome_name
     }
@@ -583,12 +607,13 @@ impl<'a, 'g> Player<'a, 'g> {
     /// Payoffs associated with the outcome
     ///
     /// If omitted they may be defined on another node.
+    #[must_use]
     pub fn outcome_payoffs(self) -> Option<&'g [BigRational]> {
         self.raw.outcome_payoffs.as_deref()
     }
 }
 
-impl<'a, 'g> Display for Player<'a, 'g> {
+impl Display for Player<'_, '_> {
     fn fmt(&self, out: &mut Formatter<'_>) -> Result<(), FmtError> {
         write!(
             out,
@@ -601,7 +626,7 @@ impl<'a, 'g> Display for Player<'a, 'g> {
         if self.raw.declared {
             let (label, actions) = self.entry();
             write!(out, " \"{}\" {{ ", label.escape())?;
-            for action in actions.iter() {
+            for action in actions {
                 write!(out, "\"{}\" ", action.escape())?;
             }
             write!(out, "}}")?;
@@ -612,8 +637,8 @@ impl<'a, 'g> Display for Player<'a, 'g> {
         }
         if let Some(payoffs) = &self.raw.outcome_payoffs {
             write!(out, " {{ ")?;
-            for payoff in payoffs.iter() {
-                write!(out, "{} ", payoff)?;
+            for payoff in payoffs {
+                write!(out, "{payoff} ")?;
             }
             write!(out, "}}")?;
         }
@@ -631,11 +656,13 @@ pub struct Terminal<'a, 'g> {
 
 impl<'a, 'g> Terminal<'a, 'g> {
     /// The name of this node
+    #[must_use]
     pub fn name(self) -> &'a EscapedStr {
         self.raw.name
     }
 
     /// The outcome id
+    #[must_use]
     pub fn outcome(self) -> u64 {
         self.raw.outcome
     }
@@ -643,25 +670,27 @@ impl<'a, 'g> Terminal<'a, 'g> {
     /// The name of this outcome
     ///
     /// Note that if omitted it may be specified on a different node with the same outcome.
+    #[must_use]
     pub fn outcome_name(self) -> Option<&'a EscapedStr> {
         self.raw.outcome_name
     }
 
     /// The payoffs to every player
+    #[must_use]
     pub fn outcome_payoffs(self) -> &'g [BigRational] {
         &self.raw.outcome_payoffs
     }
 }
 
-impl<'a, 'g> Display for Terminal<'a, 'g> {
+impl Display for Terminal<'_, '_> {
     fn fmt(&self, out: &mut Formatter<'_>) -> Result<(), FmtError> {
         write!(out, "\"{}\" {}", self.raw.name.escape(), self.raw.outcome)?;
         if let Some(name) = self.raw.outcome_name {
             write!(out, " \"{}\"", name.escape())?;
         }
         write!(out, " {{ ")?;
-        for payoff in self.raw.outcome_payoffs.iter() {
-            write!(out, "{} ", payoff)?;
+        for payoff in &self.raw.outcome_payoffs {
+            write!(out, "{payoff} ")?;
         }
         write!(out, "}}")
     }
@@ -697,14 +726,14 @@ fn big_float(input: &str) -> IResult<&str, BigRational> {
     if !dec.is_empty() {
         let pow: u32 = dec.len().try_into().map_err(|_| fail(input))?;
         res += BigRational::new(dec.parse().unwrap(), BigInt::from(10).pow(pow));
-    };
+    }
     if let Some((neg, exp)) = exp {
         let exp: i32 = exp.parse().map_err(|_| fail(input))?;
         res *= BigRational::from_integer(10.into()).pow(if neg { -exp } else { exp });
-    };
+    }
     if main_neg {
         res = -res;
-    };
+    }
     Ok((res_input, res))
 }
 
@@ -780,8 +809,8 @@ fn resolve_infoset<'a, A: PartialEq>(
     infoset: u64,
     declared: Option<(&'a EscapedStr, Vec<A>)>,
 ) -> Result<(bool, usize), Error<'a>> {
-    match declared {
-        Some((name, actions)) => match map.entry(infoset) {
+    if let Some((name, actions)) = declared {
+        match map.entry(infoset) {
             // a first declaration is stored (boxed), a repeat is only compared against the stored
             // one, so the parsed `Vec` is never boxed just to be dropped
             Entry::Vacant(ent) => {
@@ -799,13 +828,12 @@ fn resolve_infoset<'a, A: PartialEq>(
                     Ok((true, actions.len()))
                 }
             }
-        },
-        None => {
-            let (_, actions) = map
-                .get(&infoset)
-                .ok_or(ValidationError::UndeclaredInfoset)?;
-            Ok((false, actions.len()))
         }
+    } else {
+        let (_, actions) = map
+            .get(&infoset)
+            .ok_or(ValidationError::UndeclaredInfoset)?;
+        Ok((false, actions.len()))
     }
 }
 
@@ -1294,5 +1322,145 @@ t \"\" 3 { 0 0 }
         let written = game.to_string();
         let reparsed = ExtensiveFormGame::try_from_str(written.as_str()).unwrap();
         assert_eq!(game, reparsed);
+    }
+
+    #[test]
+    fn handle_accessors() {
+        let game_str = r#"EFG 2 R "game" { "P1" "P2" } "the comment"
+c "chance" 1 "ci" { "a" 1/2 "b" 1/2 } 5 { 1 2 }
+p "pl1" 1 1 "pi1" { "x" "y" } 6 "po1" { 3 4 }
+t "ta" 1 "oa" { 7 8 }
+t "tb" 2 "ob" { 9 10 }
+p "pl2" 2 2 "pi2" { "x" "y" } 7 "po2" { 5 6 }
+t "tc" 3 "oc" { 11 12 }
+t "td" 4 "od" { 13 14 }
+"#;
+        let game = ExtensiveFormGame::try_from_str(game_str).unwrap();
+        assert_eq!(game.comment().map(EscapedStr::escape), Some("the comment"));
+        // Display covers every node kind's formatting and round-trips
+        let written = game.to_string();
+        let reparsed = ExtensiveFormGame::try_from_str(written.as_str()).unwrap();
+        assert_eq!(game, reparsed);
+
+        let Node::Chance(chance) = game.root() else {
+            panic!("expected a chance root");
+        };
+        assert_eq!(chance.name().escape(), "chance");
+        assert_eq!(chance.infoset(), 1);
+        assert_eq!(chance.infoset_name().escape(), "ci");
+        assert_eq!(chance.len(), 2);
+        assert_eq!(chance.outcome(), 5);
+        let chance_payoffs: Vec<_> = chance
+            .outcome_payoffs()
+            .unwrap()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(chance_payoffs, ["1", "2"]);
+        let chance_labels: Vec<_> = chance
+            .actions()
+            .map(|(label, _, _)| label.escape())
+            .collect();
+        assert_eq!(chance_labels, ["a", "b"]);
+        assert!(chance.action_at(0).is_some());
+        assert!(chance.action_at(2).is_none());
+        assert!(chance.action(EscapedStr::new("none")).is_none());
+        let (prob, first_child) = chance.action(EscapedStr::new("a")).unwrap();
+        assert_eq!(prob.to_string(), "1/2");
+
+        let Node::Player(player) = first_child else {
+            panic!("expected a player after chance action a");
+        };
+        assert_eq!(player.name().escape(), "pl1");
+        assert_eq!(player.player_num(), 1);
+        assert_eq!(player.infoset(), 1);
+        assert_eq!(player.infoset_name().escape(), "pi1");
+        assert_eq!(player.len(), 2);
+        assert_eq!(player.outcome(), 6);
+        assert_eq!(player.outcome_name().map(EscapedStr::escape), Some("po1"));
+        let player_payoffs: Vec<_> = player
+            .outcome_payoffs()
+            .unwrap()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(player_payoffs, ["3", "4"]);
+        let player_labels: Vec<_> = player.actions().map(|(label, _)| label.escape()).collect();
+        assert_eq!(player_labels, ["x", "y"]);
+        assert!(player.action(EscapedStr::new("none")).is_none());
+        assert!(player.action(EscapedStr::new("y")).is_some());
+        let (label, leaf) = player.action_at(0).unwrap();
+        assert_eq!(label.escape(), "x");
+        assert!(player.action_at(2).is_none());
+
+        let Node::Terminal(terminal) = leaf else {
+            panic!("expected a terminal after player action x");
+        };
+        assert_eq!(terminal.name().escape(), "ta");
+        assert_eq!(terminal.outcome(), 1);
+        assert_eq!(terminal.outcome_name().map(EscapedStr::escape), Some("oa"));
+        let terminal_payoffs: Vec<_> = terminal
+            .outcome_payoffs()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(terminal_payoffs, ["7", "8"]);
+    }
+
+    #[test]
+    fn error_display() {
+        let parse_err = ExtensiveFormGame::try_from_str("not an efg").unwrap_err();
+        assert!(parse_err.to_string().starts_with("error parsing game at:"));
+
+        let bad = "EFG 2 R \"\" { \"1\" \"2\" }\np \"\" 3 1 \"a\" { \"x\" } 0\nt \"\" 1 { 0 0 }\n";
+        assert_eq!(
+            ExtensiveFormGame::try_from_str(bad)
+                .unwrap_err()
+                .to_string(),
+            "invalid efg: InvalidPlayerNum"
+        );
+        assert_eq!(
+            ValidationError::ChanceNotDistribution.to_string(),
+            "ChanceNotDistribution"
+        );
+    }
+
+    #[test]
+    fn trailing_input_is_rejected() {
+        let game = r#"EFG 2 R "" { "1" "2" } t "" 1 { 1 2 } trailing"#;
+        assert!(matches!(
+            ExtensiveFormGame::try_from_str(game),
+            Err(Error::Parse("trailing"))
+        ));
+    }
+
+    #[test]
+    fn rejects_overflowing_exponent() {
+        // an exponent that doesn't fit an i32 fails the number parse
+        assert!(super::big_float("1e99999999999 ").is_err());
+    }
+
+    #[test]
+    fn outcome_data_filled_across_nodes() {
+        // an outcome's name and payoffs may be supplied on a later node than where it first appears
+        let game = "EFG 2 R \"\" { \"1\" \"2\" }
+p \"\" 1 1 \"i\" { \"x\" } 1
+t \"\" 1 \"named\" { 3 4 }
+";
+        assert!(ExtensiveFormGame::try_from_str(game).is_ok());
+    }
+
+    #[test]
+    fn chance_null_outcome_with_payoffs() {
+        // outcome validation also runs for chance nodes
+        assert_eq!(
+            validation_err(
+                "EFG 2 R \"\" { \"1\" \"2\" }
+c \"\" 1 \"i\" { \"x\" 1 } 0 { 1 2 }
+t \"\" 1 { 0 0 }
+"
+            ),
+            ValidationError::NullOutcomePayoffs
+        );
     }
 }

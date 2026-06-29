@@ -20,15 +20,17 @@ impl EscapedStr {
         );
         // SAFETY: `EscapedStr` is `#[repr(transparent)]` over `str`, so a `&str` and a
         // `&EscapedStr` share the same layout.
-        unsafe { &*(escaped as *const str as *const EscapedStr) }
+        unsafe { &*(std::ptr::from_ref::<str>(escaped) as *const EscapedStr) }
     }
 
     /// The string in its original, escaped form
+    #[must_use]
     pub fn escape(&self) -> &str {
         &self.escaped
     }
 
     /// Get an iterator over the true characters
+    #[must_use]
     pub fn unescape(&self) -> Unescaped<'_> {
         Unescaped {
             chars: self.escaped.chars().peekable(),
@@ -42,22 +44,22 @@ impl Display for EscapedStr {
     }
 }
 
-/// An iterator over the true characters of an [EscapedStr]
+/// An iterator over the true characters of an [`EscapedStr`]
 #[derive(Debug, Clone)]
 pub struct Unescaped<'a> {
     chars: Peekable<Chars<'a>>,
 }
 
-impl<'a> Display for Unescaped<'a> {
+impl Display for Unescaped<'_> {
     fn fmt(&self, out: &mut Formatter<'_>) -> Result<(), fmt::Error> {
         for chr in self.clone() {
-            write!(out, "{}", chr)?;
+            write!(out, "{chr}")?;
         }
         Ok(())
     }
 }
 
-impl<'a> Iterator for Unescaped<'a> {
+impl Iterator for Unescaped<'_> {
     type Item = char;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -75,7 +77,7 @@ impl<'a> Iterator for Unescaped<'a> {
     }
 }
 
-impl<'a> FusedIterator for Unescaped<'a> {}
+impl FusedIterator for Unescaped<'_> {}
 
 #[cfg(test)]
 mod tests {
@@ -93,5 +95,12 @@ mod tests {
         assert_eq!(EscapedStr::new(r"a\b").to_string(), r"a\b");
         assert_eq!(EscapedStr::new(r"a\nb").to_string(), r"a\nb");
         assert_eq!(EscapedStr::new(r"a\\b").to_string(), r"a\\b");
+    }
+
+    #[test]
+    fn unescape_collects() {
+        // collecting drives size_hint; `\"` is the one sequence that shrinks two chars to one
+        let chars: Vec<char> = EscapedStr::new(r#"a\"b"#).unescape().collect();
+        assert_eq!(chars, ['a', '"', 'b']);
     }
 }
