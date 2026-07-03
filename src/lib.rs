@@ -738,15 +738,13 @@ fn big_float(input: &str) -> IResult<&str, BigRational> {
 }
 
 fn big_rational(input: &str) -> IResult<&str, BigRational> {
-    let (input, (num, denom)) =
-        pair(big_float, opt(preceded(char('/'), big_float))).parse(input)?;
-    Ok((
-        input,
-        match denom {
-            Some(denom) => num / denom,
-            None => num,
-        },
-    ))
+    let (rest, (num, denom)) = pair(big_float, opt(preceded(char('/'), big_float))).parse(input)?;
+    match denom {
+        // a zero denominator would panic in num-rational's `Div`; reject it as a parse error
+        Some(denom) if denom.is_zero() => Err(fail(input)),
+        Some(denom) => Ok((rest, num / denom)),
+        None => Ok((rest, num)),
+    }
 }
 
 fn label(input: &str) -> IResult<&str, &EscapedStr> {
@@ -1438,6 +1436,16 @@ t "td" 4 "od" { 13 14 }
     fn rejects_overflowing_exponent() {
         // an exponent that doesn't fit an i32 fails the number parse
         assert!(super::big_float("1e99999999999 ").is_err());
+    }
+
+    #[test]
+    fn rejects_zero_denominator() {
+        // a zero denominator must surface as a parse error rather than panicking in `Div`
+        assert!(super::big_rational("1/0 ").is_err());
+        assert!(
+            ExtensiveFormGame::try_from_str("EFG 2 R \"\" { \"1\" \"2\" }\nt \"\" 1 { 1/0 2 }\n")
+                .is_err()
+        );
     }
 
     #[test]
