@@ -81,7 +81,7 @@ struct RawTerminal<'a> {
     name: &'a EscapedStr,
     outcome: u64,
     outcome_name: Option<&'a EscapedStr>,
-    outcome_payoffs: Box<[BigRational]>,
+    outcome_payoffs: Option<Box<[BigRational]>>,
 }
 
 /// A full extensive form game
@@ -279,7 +279,7 @@ impl<'a> ExtensiveFormGame<'a> {
                     self.validate_outcome(
                         term.outcome,
                         term.outcome_name,
-                        Some(&term.outcome_payoffs),
+                        term.outcome_payoffs.as_deref(),
                         &mut outcomes,
                     )?;
                 }
@@ -676,9 +676,12 @@ impl<'a, 'g> Terminal<'a, 'g> {
     }
 
     /// The payoffs to every player
+    ///
+    /// A terminal with the null (0) outcome, or one that only references an outcome defined on
+    /// another node, has no payoffs of its own; if omitted they may be defined elsewhere.
     #[must_use]
-    pub fn outcome_payoffs(self) -> &'g [BigRational] {
-        &self.raw.outcome_payoffs
+    pub fn outcome_payoffs(self) -> Option<&'g [BigRational]> {
+        self.raw.outcome_payoffs.as_deref()
     }
 }
 
@@ -688,11 +691,14 @@ impl Display for Terminal<'_, '_> {
         if let Some(name) = self.raw.outcome_name {
             write!(out, " \"{}\"", name.escape())?;
         }
-        write!(out, " {{ ")?;
-        for payoff in &self.raw.outcome_payoffs {
-            write!(out, "{payoff} ")?;
+        if let Some(payoffs) = &self.raw.outcome_payoffs {
+            write!(out, " {{ ")?;
+            for payoff in payoffs {
+                write!(out, "{payoff} ")?;
+            }
+            write!(out, "}}")?;
         }
-        write!(out, "}}")
+        Ok(())
     }
 }
 
@@ -936,7 +942,8 @@ fn parse_terminal(input: &str) -> IResult<&str, RawTerminal<'_>> {
         preceded(multispace1, label),
         preceded(multispace1, u64),
         opt(preceded(multispace1, label)),
-        preceded(multispace1, commalist(big_rational)),
+        // a null (0) or already-defined outcome may omit its payoffs, matching chance/player nodes
+        opt(preceded(multispace1, commalist(big_rational))),
     )
         .parse(input)?;
     Ok((
@@ -945,7 +952,7 @@ fn parse_terminal(input: &str) -> IResult<&str, RawTerminal<'_>> {
             name,
             outcome,
             outcome_name,
-            outcome_payoffs: payoffs.into(),
+            outcome_payoffs: payoffs.map(Into::into),
         },
     ))
 }
@@ -1127,6 +1134,7 @@ t "tr" 2 "o2" { 3 4 }
         assert_eq!(left.outcome_name().map(EscapedStr::escape), Some("o1"));
         let payoffs: Vec<_> = left
             .outcome_payoffs()
+            .unwrap()
             .iter()
             .map(BigRational::to_string)
             .collect();
@@ -1400,6 +1408,7 @@ t "td" 4 "od" { 13 14 }
         assert_eq!(terminal.outcome_name().map(EscapedStr::escape), Some("oa"));
         let terminal_payoffs: Vec<_> = terminal
             .outcome_payoffs()
+            .unwrap()
             .iter()
             .map(ToString::to_string)
             .collect();
@@ -1480,5 +1489,35 @@ t \"\" 1 { 0 0 }
             ),
             ValidationError::NullOutcomePayoffs
         );
+    }
+
+    #[test]
+    fn terminal_null_and_referenced_outcomes() {
+        // `t "" 0` (null outcome, no payoffs) and a terminal that only references an outcome
+        // defined on another node both parse and round-trip
+        let game_str = "EFG 2 R \"\" { \"1\" \"2\" }
+p \"\" 1 1 \"i\" { \"L\" \"M\" \"R\" } 0
+t \"a\" 0
+t \"b\" 1 { 3 4 }
+t \"c\" 1
+";
+        let game = ExtensiveFormGame::try_from_str(game_str).unwrap();
+        let Node::Player(root) = game.root() else {
+            panic!("expected a player root");
+        };
+        let Some(Node::Terminal(null_term)) = root.action(EscapedStr::new("L")) else {
+            panic!("expected a terminal after action L");
+        };
+        assert_eq!(null_term.outcome(), 0);
+        assert!(null_term.outcome_payoffs().is_none());
+        let Some(Node::Terminal(referenced)) = root.action(EscapedStr::new("R")) else {
+            panic!("expected a terminal after action R");
+        };
+        assert_eq!(referenced.outcome(), 1);
+        assert!(referenced.outcome_payoffs().is_none());
+        // the omission is preserved through a Display round-trip
+        let written = game.to_string();
+        let reparsed = ExtensiveFormGame::try_from_str(written.as_str()).unwrap();
+        assert_eq!(game, reparsed);
     }
 }
