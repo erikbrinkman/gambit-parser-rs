@@ -959,7 +959,8 @@ fn parse_game(input: &str) -> Result<(&str, ExtensiveFormGame<'_>), Error<'_>> {
                 multispace1,
                 tag("2"),
                 multispace1,
-                tag("R"),
+                // Gambit accepts either data-type letter; `D` is legacy but still circulates
+                one_of("RD"),
                 multispace1,
             ),
             label,
@@ -1421,6 +1422,15 @@ t "td" 4 "od" { 13 14 }
             ValidationError::ChanceNotDistribution.to_string(),
             "ChanceNotDistribution"
         );
+    }
+
+    #[test]
+    fn accepts_d_data_type() {
+        // Gambit reads either the R or legacy D data-type letter; Display normalizes to R
+        let game =
+            ExtensiveFormGame::try_from_str("EFG 2 D \"\" { \"1\" \"2\" }\nt \"\" 1 { 1 2 }\n")
+                .unwrap();
+        assert!(game.to_string().starts_with("EFG 2 R "));
     }
 
     #[test]
