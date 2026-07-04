@@ -60,6 +60,7 @@ struct RawChance<'a> {
     declared: bool,
     children: Box<[RawNode<'a>]>,
     outcome: u64,
+    outcome_name: Option<&'a EscapedStr>,
     outcome_payoffs: Option<Box<[BigRational]>>,
 }
 
@@ -260,7 +261,7 @@ impl<'a> ExtensiveFormGame<'a> {
                 RawNode::Chance(chance) => {
                     self.validate_outcome(
                         chance.outcome,
-                        None,
+                        chance.outcome_name,
                         chance.outcome_payoffs.as_deref(),
                         &mut outcomes,
                     )?;
@@ -481,6 +482,14 @@ impl<'a, 'g> Chance<'a, 'g> {
         self.raw.outcome
     }
 
+    /// The name of the outcome
+    ///
+    /// If omitted it may still be defined on another node.
+    #[must_use]
+    pub fn outcome_name(self) -> Option<&'a EscapedStr> {
+        self.raw.outcome_name
+    }
+
     /// Outcome payoffs for this node
     ///
     /// Outcome payoffs are added to every players' payoffs for traversing through this node. Note
@@ -504,6 +513,9 @@ impl Display for Chance<'_, '_> {
             write!(out, "}}")?;
         }
         write!(out, " {}", self.raw.outcome)?;
+        if let Some(name) = self.raw.outcome_name {
+            write!(out, " \"{}\"", name.escape())?;
+        }
         if let Some(payoffs) = &self.raw.outcome_payoffs {
             write!(out, " {{ ")?;
             for payoff in payoffs {
@@ -868,7 +880,7 @@ fn parse_chance<'a>(
     input: &'a str,
     infosets: &mut Infosets<'a>,
 ) -> Result<(&'a str, RawChance<'a>), Error<'a>> {
-    let (input, (name, infoset, declared, outcome, outcome_payoffs)) = (
+    let (input, (name, infoset, declared, outcome, outcome_name, outcome_payoffs)) = (
         preceded(multispace1, label),
         preceded(multispace1, u64),
         opt((
@@ -879,6 +891,9 @@ fn parse_chance<'a>(
             ),
         )),
         preceded(multispace1, u64),
+        // Gambit shares one outcome writer across node kinds, so a chance node can carry an
+        // outcome name too even though the format docs omit it
+        opt(preceded(multispace1, label)),
         opt(preceded(multispace1, commalist(big_rational))),
     )
         .parse(input)?;
@@ -892,6 +907,7 @@ fn parse_chance<'a>(
             declared,
             children,
             outcome,
+            outcome_name,
             outcome_payoffs: outcome_payoffs.map(Into::into),
         },
     ))
@@ -1489,6 +1505,25 @@ t \"\" 1 { 0 0 }
             ),
             ValidationError::NullOutcomePayoffs
         );
+    }
+
+    #[test]
+    fn chance_outcome_name() {
+        // a chance node may carry an outcome name (Gambit writes and reads one)
+        let game_str = "EFG 2 R \"\" { \"1\" \"2\" }
+c \"\" 1 \"i\" { \"a\" 1/2 \"b\" 1/2 } 1 \"oname\" { 3 4 }
+t \"\" 1 { 3 4 }
+t \"\" 1 { 3 4 }
+";
+        let game = ExtensiveFormGame::try_from_str(game_str).unwrap();
+        let Node::Chance(root) = game.root() else {
+            panic!("expected a chance root");
+        };
+        assert_eq!(root.outcome_name().map(EscapedStr::escape), Some("oname"));
+        // the name is preserved through a Display round-trip
+        let written = game.to_string();
+        let reparsed = ExtensiveFormGame::try_from_str(written.as_str()).unwrap();
+        assert_eq!(game, reparsed);
     }
 
     #[test]
