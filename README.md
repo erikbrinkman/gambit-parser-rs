@@ -21,6 +21,18 @@ File::open("my path")?.read_to_string(&mut buffer)?;
 let parsed: ExtensiveFormGame<'_> = buffer.as_str().try_into()?;
 ```
 
+A parsed game serializes back to the `.efg` format via `Display`:
+
+```rust
+use gambit_parser::WriteMode;
+
+// `to_string()` (plain `Display`) reproduces the input faithfully
+let text = parsed.to_string();
+// or pick how much of each shared infoset/outcome to repeat
+let compact = parsed.display(WriteMode::Minimal).to_string();
+let expanded = parsed.display(WriteMode::Exhaustive).to_string();
+```
+
 Remarks
 -------
 
@@ -33,11 +45,19 @@ distribution with rounded decimals — e.g. `0.333333` repeated three times,
 summing to `0.999999` — parses fine; normalize the probabilities yourself if you
 need an exact distribution.
 
+This parser diverges from Gambit's self-delimiting lexer in a few ways that only
+affect hand-written files; everything Gambit's own writer emits round-trips. It
+requires whitespace between tokens, so `"x"1`, `t"" 1`, and an empty `{ }`
+player list are rejected where Gambit accepts them, and it rejects trailing
+content after the root subtree that Gambit ignores. Conversely, it compares
+repeated outcome and probability definitions numerically rather than textually,
+so `{ 1/2, 2 }` followed by `{ 0.5, 2 }` for the same id parses here but errors
+in Gambit.
+
 To Do
 -----
 
-Ultimately this represents a data model that could be modified and serialized,
-but that's not implemented yet. The current version keeps a reference to the
-underlying file bytes, to implement a full data model there should be an owned
-version of the `ExtensiveFormGame` that supports full serialization and
-modification.
+Parsing and serialization are implemented, but the parsed `ExtensiveFormGame`
+borrows the underlying file bytes and is read-only. A full data model would need
+an owned version of `ExtensiveFormGame` that can be constructed and modified in
+memory rather than only parsed from text; that's not implemented yet.
