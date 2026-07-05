@@ -23,7 +23,7 @@ use nom::{
 };
 use num_bigint::BigInt;
 use num_rational::BigRational;
-use num_traits::{One, Zero};
+use num_traits::Zero;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::error::Error as StdError;
@@ -188,8 +188,6 @@ impl StdError for Error<'_> {}
 #[derive(Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ValidationError {
-    /// The probabilities of actions associated with a chance node don't sum to one
-    ChanceNotDistribution,
     /// A player's number wasn't between one and the number of players
     InvalidPlayerNum,
     /// An infoset had different names attached to it
@@ -250,16 +248,8 @@ impl<'a> ExtensiveFormGame<'a> {
     }
 
     /// Infoset consistency (matching names and actions across a shared id) and player number ranges
-    /// are enforced while parsing, so this only covers what the tree shape can't: chance
-    /// distributions and outcome agreement.
+    /// are enforced while parsing, so this only covers outcome agreement.
     fn validate(&self) -> Result<(), ValidationError> {
-        for (_, actions) in self.infosets.chance.values() {
-            let total: BigRational = actions.iter().map(|(_, prob)| prob).sum();
-            if total != BigRational::one() {
-                return Err(ValidationError::ChanceNotDistribution);
-            }
-        }
-
         // every parsed node lives in the arena, so a flat pass visits the whole tree
         let mut outcomes = HashMap::new();
         for node in &self.nodes {
@@ -1213,16 +1203,18 @@ t "tr" 2 "o2" { 3 4 }
     }
 
     #[test]
-    fn not_distribution() {
-        assert_eq!(
-            validation_err(
-                "EFG 2 R \"\" { \"1\" \"2\" }
+    fn chance_probabilities_need_not_sum_to_one() {
+        // matching Gambit, chance probabilities are kept as written and not checked as a distribution
+        let game = "EFG 2 R \"\" { \"1\" \"2\" }
 c \"\" 1 \"a\" { \"x\" 9/10 } 0
 t \"\" 1 { 0 0 }
-"
-            ),
-            ValidationError::ChanceNotDistribution
-        );
+";
+        let parsed = ExtensiveFormGame::try_from_str(game).unwrap();
+        let Node::Chance(root) = parsed.root() else {
+            panic!("expected a chance root");
+        };
+        let (prob, _) = root.action(EscapedStr::new("x")).unwrap();
+        assert_eq!(prob.to_string(), "9/10");
     }
 
     #[test]
@@ -1499,8 +1491,8 @@ t "td" 4 "od" { 13 14 }
             "invalid efg: InvalidPlayerNum"
         );
         assert_eq!(
-            ValidationError::ChanceNotDistribution.to_string(),
-            "ChanceNotDistribution"
+            ValidationError::NoOutcomePayoffs.to_string(),
+            "NoOutcomePayoffs"
         );
     }
 
