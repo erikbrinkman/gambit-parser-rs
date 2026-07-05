@@ -27,6 +27,12 @@ Remarks
 Gambit's reader duplicates runs of backslashes when reading a quoted label;
 this parser does not reproduce that bug.
 
+Chance-node probabilities are kept as written and are not required to sum to
+one, matching Gambit (which performs no such check). A file that approximates a
+distribution with rounded decimals — e.g. `0.333333` repeated three times,
+summing to `0.999999` — parses fine; normalize the probabilities yourself if you
+need an exact distribution.
+
 To Do
 -----
 
