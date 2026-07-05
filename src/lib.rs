@@ -35,6 +35,10 @@ type ChanceInfoset<'a> = (&'a EscapedStr, Box<[(&'a EscapedStr, BigRational)]>);
 /// A player infoset's label paired with its ordered action labels
 type PlayerInfoset<'a> = (&'a EscapedStr, Box<[&'a EscapedStr]>);
 
+/// Every outcome defined while parsing, keyed by id. Each entry holds the outcome's name and its
+/// payoffs, which the tree nodes reference by id. The null (0) outcome is never stored.
+type Outcomes<'a> = HashMap<u64, (&'a EscapedStr, Box<[BigRational]>)>;
+
 /// Every infoset seen while parsing, keyed by id. Player infosets are split per player (index =
 /// `player_num - 1`); chance is its own namespace. Each entry holds the infoset's label and ordered
 /// actions, which the tree nodes reference by id.
@@ -56,7 +60,7 @@ enum RawNode<'a> {
     Terminal(RawTerminal<'a>),
 }
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 struct RawChance<'a> {
     name: &'a EscapedStr,
     infoset: u64,
@@ -64,11 +68,11 @@ struct RawChance<'a> {
     declared: bool,
     children: Box<[NodeId]>,
     outcome: u64,
-    outcome_name: Option<&'a EscapedStr>,
-    outcome_payoffs: Option<Box<[BigRational]>>,
+    // did THIS node write the outcome's name and payoffs, or reference it by id?
+    outcome_declared: bool,
 }
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 struct RawPlayer<'a> {
     name: &'a EscapedStr,
     player_num: usize,
@@ -77,16 +81,16 @@ struct RawPlayer<'a> {
     declared: bool,
     children: Box<[NodeId]>,
     outcome: u64,
-    outcome_name: Option<&'a EscapedStr>,
-    outcome_payoffs: Option<Box<[BigRational]>>,
+    // did THIS node write the outcome's name and payoffs, or reference it by id?
+    outcome_declared: bool,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 struct RawTerminal<'a> {
     name: &'a EscapedStr,
     outcome: u64,
-    outcome_name: Option<&'a EscapedStr>,
-    outcome_payoffs: Option<Box<[BigRational]>>,
+    // did THIS node write the outcome's name and payoffs, or reference it by id?
+    outcome_declared: bool,
 }
 
 /// A full extensive form game
@@ -98,7 +102,7 @@ struct RawTerminal<'a> {
 ///
 /// ```
 /// # use gambit_parser::ExtensiveFormGame;
-/// let gambit = r#"EFG 2 R "" { "1" "2" } t "" 1 { 1 2 }"#;
+/// let gambit = r#"EFG 2 R "" { "1" "2" } t "" 1 "" { 1 2 }"#;
 /// let game: ExtensiveFormGame<'_> = gambit.try_into().unwrap();
 /// let output = game.to_string();
 /// ```
@@ -108,7 +112,7 @@ pub struct ExtensiveFormGame<'a> {
     player_names: Box<[&'a EscapedStr]>,
     comment: Option<&'a EscapedStr>,
     infosets: Infosets<'a>,
-    // every node in the tree, stored flat; children reference each other by arena index
+    outcomes: Outcomes<'a>,
     nodes: Box<[RawNode<'a>]>,
     root: NodeId,
 }
@@ -142,8 +146,18 @@ impl<'a> ExtensiveFormGame<'a> {
         match &self.nodes[id.0] {
             RawNode::Chance(raw) => Node::Chance(Chance { game: self, raw }),
             RawNode::Player(raw) => Node::Player(Player { game: self, raw }),
-            RawNode::Terminal(raw) => Node::Terminal(Terminal { raw }),
+            RawNode::Terminal(raw) => Node::Terminal(Terminal { game: self, raw }),
         }
+    }
+
+    /// The outcome's name, or `None` for the null (0) outcome
+    fn outcome_name(&self, outcome: u64) -> Option<&'a EscapedStr> {
+        self.outcomes.get(&outcome).map(|(name, _)| *name)
+    }
+
+    /// The outcome's payoffs, or `None` for the null (0) outcome
+    fn outcome_payoffs(&self, outcome: u64) -> Option<&[BigRational]> {
+        self.outcomes.get(&outcome).map(|(_, payoffs)| &payoffs[..])
     }
 }
 
@@ -169,7 +183,8 @@ pub enum Error<'a> {
     ///
     /// This will show the remainder of the string where the parse error occurred
     Parse(&'a str),
-    /// A problem validating the tree after parsing
+    /// A well-formed line that makes the game inconsistent (a mismatched infoset, an undefined
+    /// outcome, and so on)
     Validation(ValidationError),
 }
 
@@ -194,16 +209,16 @@ pub enum ValidationError {
     NonMatchingInfosetNames,
     /// An infoset had different sets of associated actions
     NonMatchingInfosetActions,
-    /// There was payoff data associated with the null (0) outcome
+    /// A name or payoffs were attached to the null (0) outcome
     NullOutcomePayoffs,
     /// The number of specified payoffs did not match the number of players
     InvalidNumberOfPayoffs,
-    /// An outcome had different names attached to it
+    /// An outcome was defined with a name that didn't match its first definition
     NonMatchingOutcomeNames,
-    /// An outcome had different associated payoffs
+    /// An outcome was defined with payoffs that didn't match its first definition
     NonMatchingOutcomePayoffs,
-    /// An outcome was defined without payoffs
-    NoOutcomePayoffs,
+    /// A node referenced an outcome that was never defined
+    UndefinedOutcome,
     /// A node omitted its action list for an infoset that was never declared
     UndeclaredInfoset,
 }
@@ -243,96 +258,7 @@ impl<'a> ExtensiveFormGame<'a> {
         if !rest.is_empty() {
             return Err(Error::Parse(rest));
         }
-        game.validate()?;
         Ok(game)
-    }
-
-    /// Infoset consistency (matching names and actions across a shared id) and player number ranges
-    /// are enforced while parsing, so this only covers outcome agreement.
-    fn validate(&self) -> Result<(), ValidationError> {
-        // every parsed node lives in the arena, so a flat pass visits the whole tree
-        let mut outcomes = HashMap::new();
-        for node in &self.nodes {
-            match node {
-                RawNode::Chance(chance) => self.validate_outcome(
-                    chance.outcome,
-                    chance.outcome_name,
-                    chance.outcome_payoffs.as_deref(),
-                    &mut outcomes,
-                )?,
-                RawNode::Player(player) => self.validate_outcome(
-                    player.outcome,
-                    player.outcome_name,
-                    player.outcome_payoffs.as_deref(),
-                    &mut outcomes,
-                )?,
-                RawNode::Terminal(term) => self.validate_outcome(
-                    term.outcome,
-                    term.outcome_name,
-                    term.outcome_payoffs.as_deref(),
-                    &mut outcomes,
-                )?,
-            }
-        }
-
-        for (_, (_, pays)) in outcomes {
-            if pays.is_none() {
-                return Err(ValidationError::NoOutcomePayoffs);
-            }
-        }
-
-        Ok(())
-    }
-
-    fn validate_outcome<'b>(
-        &self,
-        outcome: u64,
-        outcome_name: Option<&'a EscapedStr>,
-        outcome_payoffs: Option<&'b [BigRational]>,
-        outcomes: &mut HashMap<u64, (Option<&'a EscapedStr>, Option<&'b [BigRational]>)>,
-    ) -> Result<(), ValidationError> {
-        if outcome == 0 {
-            if outcome_payoffs.is_some() {
-                return Err(ValidationError::NullOutcomePayoffs);
-            }
-        } else {
-            match outcomes.entry(outcome) {
-                Entry::Vacant(ent) => match outcome_payoffs {
-                    Some(pays) => {
-                        if pays.len() == self.player_names.len() {
-                            ent.insert((outcome_name, Some(pays)));
-                        } else {
-                            return Err(ValidationError::InvalidNumberOfPayoffs);
-                        }
-                    }
-                    None => {
-                        ent.insert((outcome_name, None));
-                    }
-                },
-                Entry::Occupied(mut ent) => {
-                    let (name, payoffs) = ent.get_mut();
-                    match (name, outcome_name) {
-                        (Some(old), Some(new)) if old != &new => {
-                            return Err(ValidationError::NonMatchingOutcomeNames);
-                        }
-                        (old @ None, Some(new)) => {
-                            *old = Some(new);
-                        }
-                        _ => (),
-                    }
-                    match (payoffs, outcome_payoffs) {
-                        (Some(old), Some(new)) if old != &new => {
-                            return Err(ValidationError::NonMatchingOutcomePayoffs);
-                        }
-                        (old @ None, Some(new)) => {
-                            *old = Some(new);
-                        }
-                        _ => (),
-                    }
-                }
-            }
-        }
-        Ok(())
     }
 }
 
@@ -389,6 +315,30 @@ impl Display for Node<'_, '_> {
         }
         Ok(())
     }
+}
+
+/// Write a node's outcome: always the id, plus the name and payoffs when this node declared them
+/// (a node that only referenced the outcome by id writes just the id, matching the file)
+fn write_outcome(
+    out: &mut Formatter<'_>,
+    game: &ExtensiveFormGame<'_>,
+    outcome: u64,
+    declared: bool,
+) -> Result<(), FmtError> {
+    write!(out, " {outcome}")?;
+    if declared {
+        if let Some(name) = game.outcome_name(outcome) {
+            write!(out, " \"{}\"", name.escape())?;
+        }
+        if let Some(payoffs) = game.outcome_payoffs(outcome) {
+            write!(out, " {{ ")?;
+            for payoff in payoffs {
+                write!(out, "{payoff} ")?;
+            }
+            write!(out, "}}")?;
+        }
+    }
+    Ok(())
 }
 
 /// A chance node
@@ -473,19 +423,19 @@ impl<'a, 'g> Chance<'a, 'g> {
 
     /// The name of the outcome
     ///
-    /// If omitted it may still be defined on another node.
+    /// `None` for the null (0) outcome or an outcome with no name.
     #[must_use]
     pub fn outcome_name(self) -> Option<&'a EscapedStr> {
-        self.raw.outcome_name
+        self.game.outcome_name(self.raw.outcome)
     }
 
     /// Outcome payoffs for this node
     ///
-    /// Outcome payoffs are added to every players' payoffs for traversing through this node. Note
-    /// that if these are missing, they be defined at another node sharing the same outcome.
+    /// These are added to every player's payoff for traversing through this node. `None` only for
+    /// the null (0) outcome.
     #[must_use]
     pub fn outcome_payoffs(self) -> Option<&'g [BigRational]> {
-        self.raw.outcome_payoffs.as_deref()
+        self.game.outcome_payoffs(self.raw.outcome)
     }
 }
 
@@ -501,18 +451,7 @@ impl Display for Chance<'_, '_> {
             }
             write!(out, "}}")?;
         }
-        write!(out, " {}", self.raw.outcome)?;
-        if let Some(name) = self.raw.outcome_name {
-            write!(out, " \"{}\"", name.escape())?;
-        }
-        if let Some(payoffs) = &self.raw.outcome_payoffs {
-            write!(out, " {{ ")?;
-            for payoff in payoffs {
-                write!(out, "{payoff} ")?;
-            }
-            write!(out, "}}")?;
-        }
-        Ok(())
+        write_outcome(out, self.game, self.raw.outcome, self.raw.outcome_declared)
     }
 }
 
@@ -600,18 +539,18 @@ impl<'a, 'g> Player<'a, 'g> {
 
     /// The name of the outcome
     ///
-    /// If omitted it may still be defined on another node.
+    /// `None` for the null (0) outcome or an outcome with no name.
     #[must_use]
     pub fn outcome_name(self) -> Option<&'a EscapedStr> {
-        self.raw.outcome_name
+        self.game.outcome_name(self.raw.outcome)
     }
 
     /// Payoffs associated with the outcome
     ///
-    /// If omitted they may be defined on another node.
+    /// `None` only for the null (0) outcome.
     #[must_use]
     pub fn outcome_payoffs(self) -> Option<&'g [BigRational]> {
-        self.raw.outcome_payoffs.as_deref()
+        self.game.outcome_payoffs(self.raw.outcome)
     }
 }
 
@@ -633,18 +572,7 @@ impl Display for Player<'_, '_> {
             }
             write!(out, "}}")?;
         }
-        write!(out, " {}", self.raw.outcome)?;
-        if let Some(name) = self.raw.outcome_name {
-            write!(out, " \"{}\"", name.escape())?;
-        }
-        if let Some(payoffs) = &self.raw.outcome_payoffs {
-            write!(out, " {{ ")?;
-            for payoff in payoffs {
-                write!(out, "{payoff} ")?;
-            }
-            write!(out, "}}")?;
-        }
-        Ok(())
+        write_outcome(out, self.game, self.raw.outcome, self.raw.outcome_declared)
     }
 }
 
@@ -653,6 +581,7 @@ impl Display for Player<'_, '_> {
 /// Terminal nodes simply assign payoffs to every player in the game
 #[derive(Clone, Copy)]
 pub struct Terminal<'a, 'g> {
+    game: &'g ExtensiveFormGame<'a>,
     raw: &'g RawTerminal<'a>,
 }
 
@@ -671,36 +600,25 @@ impl<'a, 'g> Terminal<'a, 'g> {
 
     /// The name of this outcome
     ///
-    /// Note that if omitted it may be specified on a different node with the same outcome.
+    /// `None` for the null (0) outcome or an outcome with no name.
     #[must_use]
     pub fn outcome_name(self) -> Option<&'a EscapedStr> {
-        self.raw.outcome_name
+        self.game.outcome_name(self.raw.outcome)
     }
 
     /// The payoffs to every player
     ///
-    /// A terminal with the null (0) outcome, or one that only references an outcome defined on
-    /// another node, has no payoffs of its own; if omitted they may be defined elsewhere.
+    /// `None` only for the null (0) outcome — a terminal with no outcome attached.
     #[must_use]
     pub fn outcome_payoffs(self) -> Option<&'g [BigRational]> {
-        self.raw.outcome_payoffs.as_deref()
+        self.game.outcome_payoffs(self.raw.outcome)
     }
 }
 
 impl Display for Terminal<'_, '_> {
     fn fmt(&self, out: &mut Formatter<'_>) -> Result<(), FmtError> {
-        write!(out, "\"{}\" {}", self.raw.name.escape(), self.raw.outcome)?;
-        if let Some(name) = self.raw.outcome_name {
-            write!(out, " \"{}\"", name.escape())?;
-        }
-        if let Some(payoffs) = &self.raw.outcome_payoffs {
-            write!(out, " {{ ")?;
-            for payoff in payoffs {
-                write!(out, "{payoff} ")?;
-            }
-            write!(out, "}}")?;
-        }
-        Ok(())
+        write!(out, "\"{}\"", self.raw.name.escape())?;
+        write_outcome(out, self.game, self.raw.outcome, self.raw.outcome_declared)
     }
 }
 
@@ -850,10 +768,55 @@ fn resolve_infoset<'a, A: PartialEq>(
     }
 }
 
+/// Record or check a node's outcome, mirroring [`resolve_infoset`]. A node either defines the
+/// outcome with a name and payoffs, or references it by bare id: the first definition is stored, a
+/// repeat definition must match it exactly, and a reference must name an already-defined outcome.
+/// The null (0) outcome carries no data and is never stored.
+fn resolve_outcome<'a>(
+    outcomes: &mut Outcomes<'a>,
+    num_players: usize,
+    outcome: u64,
+    definition: Option<(&'a EscapedStr, Vec<BigRational>)>,
+) -> Result<(), Error<'a>> {
+    if let Some((name, payoffs)) = definition {
+        if outcome == 0 {
+            Err(ValidationError::NullOutcomePayoffs.into())
+        } else if payoffs.len() != num_players {
+            Err(ValidationError::InvalidNumberOfPayoffs.into())
+        } else {
+            match outcomes.entry(outcome) {
+                // a first definition is stored (boxed), a repeat is only compared against the
+                // stored one, so the parsed `Vec` is never boxed just to be dropped
+                Entry::Vacant(ent) => {
+                    ent.insert((name, payoffs.into()));
+                    Ok(())
+                }
+                Entry::Occupied(ent) => {
+                    let (stored_name, stored_payoffs) = ent.get();
+                    if *stored_name != name {
+                        Err(ValidationError::NonMatchingOutcomeNames.into())
+                    } else if **stored_payoffs != *payoffs {
+                        Err(ValidationError::NonMatchingOutcomePayoffs.into())
+                    } else {
+                        Ok(())
+                    }
+                }
+            }
+        }
+    } else if outcome != 0 && !outcomes.contains_key(&outcome) {
+        // a bare id references an outcome that must already be defined; the null (0) id is fine
+        Err(ValidationError::UndefinedOutcome.into())
+    } else {
+        Ok(())
+    }
+}
+
 /// Parse the whole game tree into a flat arena, returning the nodes and the root's id.
 fn parse_tree<'a>(
     mut input: &'a str,
     infosets: &mut Infosets<'a>,
+    outcomes: &mut Outcomes<'a>,
+    num_players: usize,
 ) -> Result<(&'a str, Box<[RawNode<'a>]>, NodeId), Error<'a>> {
     // finished nodes, in the post-order they complete (every child precedes its parent)
     let mut nodes: Vec<RawNode<'a>> = Vec::new();
@@ -866,7 +829,8 @@ fn parse_tree<'a>(
         // a chance or player node opens a frame; a terminal completes immediately
         let mut completed = match style {
             'c' => {
-                let (rest, chance, child_count) = parse_chance(input, infosets)?;
+                let (rest, chance, child_count) =
+                    parse_chance(input, infosets, outcomes, num_players)?;
                 input = rest;
                 stack.push(PendingNode {
                     node: RawNode::Chance(chance),
@@ -876,7 +840,8 @@ fn parse_tree<'a>(
                 continue;
             }
             'p' => {
-                let (rest, player, child_count) = parse_player(input, infosets)?;
+                let (rest, player, child_count) =
+                    parse_player(input, infosets, outcomes, num_players)?;
                 input = rest;
                 stack.push(PendingNode {
                     node: RawNode::Player(player),
@@ -886,7 +851,7 @@ fn parse_tree<'a>(
                 continue;
             }
             't' => {
-                let (rest, term) = parse_terminal(input)?;
+                let (rest, term) = parse_terminal(input, outcomes, num_players)?;
                 input = rest;
                 push_node(&mut nodes, RawNode::Terminal(term))
             }
@@ -916,12 +881,15 @@ fn push_node<'a>(nodes: &mut Vec<RawNode<'a>>, node: RawNode<'a>) -> NodeId {
     id
 }
 
-/// Parse a chance node's header, returning the node (children still empty) and its child count
+/// Parse a chance node's header, resolving its outcome and returning the node (children still
+/// empty) and its child count
 fn parse_chance<'a>(
     input: &'a str,
     infosets: &mut Infosets<'a>,
+    outcomes: &mut Outcomes<'a>,
+    num_players: usize,
 ) -> Result<(&'a str, RawChance<'a>, usize), Error<'a>> {
-    let (input, (name, infoset, declared, outcome, outcome_name, outcome_payoffs)) = (
+    let (input, (name, infoset, declared, outcome, definition)) = (
         preceded(multispace1, label),
         preceded(multispace1, u64),
         opt((
@@ -932,13 +900,16 @@ fn parse_chance<'a>(
             ),
         )),
         preceded(multispace1, u64),
-        // Gambit shares one outcome writer across node kinds, so a chance node can carry an
-        // outcome name too even though the format docs omit it
-        opt(preceded(multispace1, label)),
-        opt(preceded(multispace1, commalist(big_rational))),
+        // an outcome is either a bare id or a name paired with payoffs (see resolve_outcome)
+        opt((
+            preceded(multispace1, label),
+            preceded(multispace1, commalist(big_rational)),
+        )),
     )
         .parse(input)?;
     let (declared, child_count) = resolve_infoset(&mut infosets.chance, infoset, declared)?;
+    let outcome_declared = definition.is_some();
+    resolve_outcome(outcomes, num_players, outcome, definition)?;
     Ok((
         input,
         RawChance {
@@ -948,19 +919,21 @@ fn parse_chance<'a>(
             // filled once the following child nodes are parsed (see PendingNode::finish)
             children: Box::default(),
             outcome,
-            outcome_name,
-            outcome_payoffs: outcome_payoffs.map(Into::into),
+            outcome_declared,
         },
         child_count,
     ))
 }
 
-/// Parse a player node's header, returning the node (children still empty) and its child count
+/// Parse a player node's header, resolving its outcome and returning the node (children still
+/// empty) and its child count
 fn parse_player<'a>(
     input: &'a str,
     infosets: &mut Infosets<'a>,
+    outcomes: &mut Outcomes<'a>,
+    num_players: usize,
 ) -> Result<(&'a str, RawPlayer<'a>, usize), Error<'a>> {
-    let (input, (name, player_num, infoset, declared, outcome, outcome_name, outcome_payoffs)) = (
+    let (input, (name, player_num, infoset, declared, outcome, definition)) = (
         preceded(multispace1, label),
         preceded(multispace1, u64),
         preceded(multispace1, u64),
@@ -969,8 +942,11 @@ fn parse_player<'a>(
             preceded(multispace1, spacelist(label)),
         )),
         preceded(multispace1, u64),
-        opt(preceded(multispace1, label)),
-        opt(preceded(multispace1, commalist(big_rational))),
+        // an outcome is either a bare id or a name paired with payoffs (see resolve_outcome)
+        opt((
+            preceded(multispace1, label),
+            preceded(multispace1, commalist(big_rational)),
+        )),
     )
         .parse(input)?;
     let player_num: usize = player_num.try_into().map_err(|_| fail(input))?;
@@ -980,6 +956,8 @@ fn parse_player<'a>(
     }
     let (declared, child_count) =
         resolve_infoset(&mut infosets.player[player_num - 1], infoset, declared)?;
+    let outcome_declared = definition.is_some();
+    resolve_outcome(outcomes, num_players, outcome, definition)?;
     Ok((
         input,
         RawPlayer {
@@ -990,29 +968,36 @@ fn parse_player<'a>(
             // filled once the following child nodes are parsed (see PendingNode::finish)
             children: Box::default(),
             outcome,
-            outcome_name,
-            outcome_payoffs: outcome_payoffs.map(Into::into),
+            outcome_declared,
         },
         child_count,
     ))
 }
 
-fn parse_terminal(input: &str) -> IResult<&str, RawTerminal<'_>> {
-    let (input, (name, outcome, outcome_name, payoffs)) = (
+/// Parse a terminal node, resolving its outcome
+fn parse_terminal<'a>(
+    input: &'a str,
+    outcomes: &mut Outcomes<'a>,
+    num_players: usize,
+) -> Result<(&'a str, RawTerminal<'a>), Error<'a>> {
+    let (input, (name, outcome, definition)) = (
         preceded(multispace1, label),
         preceded(multispace1, u64),
-        opt(preceded(multispace1, label)),
-        // a null (0) or already-defined outcome may omit its payoffs, matching chance/player nodes
-        opt(preceded(multispace1, commalist(big_rational))),
+        // an outcome is either a bare id or a name paired with payoffs (see resolve_outcome)
+        opt((
+            preceded(multispace1, label),
+            preceded(multispace1, commalist(big_rational)),
+        )),
     )
         .parse(input)?;
+    let outcome_declared = definition.is_some();
+    resolve_outcome(outcomes, num_players, outcome, definition)?;
     Ok((
         input,
         RawTerminal {
             name,
             outcome,
-            outcome_name,
-            outcome_payoffs: payoffs.map(Into::into),
+            outcome_declared,
         },
     ))
 }
@@ -1041,7 +1026,8 @@ fn parse_game(input: &str) -> Result<(&str, ExtensiveFormGame<'_>), Error<'_>> {
         player: (0..num_players).map(|_| HashMap::new()).collect(),
         chance: HashMap::new(),
     };
-    let (input, nodes, root) = parse_tree(input, &mut infosets)?;
+    let mut outcomes = Outcomes::new();
+    let (input, nodes, root) = parse_tree(input, &mut infosets, &mut outcomes, num_players)?;
     Ok((
         input,
         ExtensiveFormGame {
@@ -1049,6 +1035,7 @@ fn parse_game(input: &str) -> Result<(&str, ExtensiveFormGame<'_>), Error<'_>> {
             player_names: player_names.into(),
             comment,
             infosets,
+            outcomes,
             nodes,
             root,
         },
@@ -1207,7 +1194,7 @@ t "tr" 2 "o2" { 3 4 }
         // matching Gambit, chance probabilities are kept as written and not checked as a distribution
         let game = "EFG 2 R \"\" { \"1\" \"2\" }
 c \"\" 1 \"a\" { \"x\" 9/10 } 0
-t \"\" 1 { 0 0 }
+t \"\" 1 \"\" { 0 0 }
 ";
         let parsed = ExtensiveFormGame::try_from_str(game).unwrap();
         let Node::Chance(root) = parsed.root() else {
@@ -1266,10 +1253,10 @@ t \"\" 1 { 0 0 }
             validation_err(
                 "EFG 2 R \"\" { \"1\" \"2\" }
 p \"\" 1 1 \"a\" { \"L\" \"R\" } 0
-t \"\" 1 { 0 0 }
+t \"\" 1 \"\" { 0 0 }
 p \"\" 1 1 \"a\" { \"R\" \"L\" } 0
-t \"\" 2 { 0 0 }
-t \"\" 3 { 0 0 }
+t \"\" 2 \"\" { 0 0 }
+t \"\" 3 \"\" { 0 0 }
 "
             ),
             ValidationError::NonMatchingInfosetActions
@@ -1295,7 +1282,7 @@ t \"\" 1 { 0 0 }
         assert_eq!(
             validation_err(
                 "EFG 2 R \"\" { \"1\" \"2\" }
-p \"\" 1 1 \"a\" { \"x\" } 0 { 0 0 }
+p \"\" 1 1 \"a\" { \"x\" } 0 \"n\" { 0 0 }
 t \"\" 1 { 0 0 }
 "
             ),
@@ -1308,7 +1295,7 @@ t \"\" 1 { 0 0 }
         assert_eq!(
             validation_err(
                 "EFG 2 R \"\" { \"1\" \"2\" }
-t \"\" 1 { 0 }
+t \"\" 1 \"\" { 0 }
 "
             ),
             ValidationError::InvalidNumberOfPayoffs
@@ -1333,8 +1320,8 @@ t \"\" 1 \"c\" { 0 0 }
         assert_eq!(
             validation_err(
                 "EFG 2 R \"\" { \"1\" \"2\" }
-p \"\" 1 1 \"a\" { \"x\" } 1 { 0 0 }
-t \"\" 1 { 1 1 }
+p \"\" 1 1 \"a\" { \"x\" } 1 \"\" { 0 0 }
+t \"\" 1 \"\" { 1 1 }
 "
             ),
             ValidationError::NonMatchingOutcomePayoffs
@@ -1342,15 +1329,15 @@ t \"\" 1 { 1 1 }
     }
 
     #[test]
-    fn no_outcome_payoffs() {
+    fn undefined_outcome() {
+        // referencing an outcome by bare id that was never defined is an error
         assert_eq!(
             validation_err(
                 "EFG 2 R \"\" { \"1\" \"2\" }
-p \"\" 1 1 \"a\" { \"x\" } 1
-t \"\" 2 { 0 0 }
+t \"\" 5
 "
             ),
-            ValidationError::NoOutcomePayoffs
+            ValidationError::UndefinedOutcome
         );
     }
 
@@ -1372,10 +1359,10 @@ t \"\" 1 { 0 0 }
     fn fills_omitted_action_list() {
         let game_str = "EFG 2 R \"\" { \"1\" \"2\" }
 p \"\" 1 1 \"a\" { \"L\" \"R\" } 0
-t \"\" 1 { 0 0 }
+t \"\" 1 \"\" { 0 0 }
 p \"\" 1 1 0
-t \"\" 2 { 0 0 }
-t \"\" 3 { 0 0 }
+t \"\" 2 \"\" { 0 0 }
+t \"\" 3 \"\" { 0 0 }
 ";
         let game = ExtensiveFormGame::try_from_str(game_str).unwrap();
         let Node::Player(root) = game.root() else {
@@ -1397,7 +1384,7 @@ t \"\" 3 { 0 0 }
     #[test]
     fn handle_accessors() {
         let game_str = r#"EFG 2 R "game" { "P1" "P2" } "the comment"
-c "chance" 1 "ci" { "a" 1/2 "b" 1/2 } 5 { 1 2 }
+c "chance" 1 "ci" { "a" 1/2 "b" 1/2 } 5 "co" { 1 2 }
 p "pl1" 1 1 "pi1" { "x" "y" } 6 "po1" { 3 4 }
 t "ta" 1 "oa" { 7 8 }
 t "tb" 2 "ob" { 9 10 }
@@ -1491,23 +1478,24 @@ t "td" 4 "od" { 13 14 }
             "invalid efg: InvalidPlayerNum"
         );
         assert_eq!(
-            ValidationError::NoOutcomePayoffs.to_string(),
-            "NoOutcomePayoffs"
+            ValidationError::UndefinedOutcome.to_string(),
+            "UndefinedOutcome"
         );
     }
 
     #[test]
     fn accepts_d_data_type() {
         // Gambit reads either the R or legacy D data-type letter; Display normalizes to R
-        let game =
-            ExtensiveFormGame::try_from_str("EFG 2 D \"\" { \"1\" \"2\" }\nt \"\" 1 { 1 2 }\n")
-                .unwrap();
+        let game = ExtensiveFormGame::try_from_str(
+            "EFG 2 D \"\" { \"1\" \"2\" }\nt \"\" 1 \"\" { 1 2 }\n",
+        )
+        .unwrap();
         assert!(game.to_string().starts_with("EFG 2 R "));
     }
 
     #[test]
     fn trailing_input_is_rejected() {
-        let game = r#"EFG 2 R "" { "1" "2" } t "" 1 { 1 2 } trailing"#;
+        let game = r#"EFG 2 R "" { "1" "2" } t "" 1 "" { 1 2 } trailing"#;
         assert!(matches!(
             ExtensiveFormGame::try_from_str(game),
             Err(Error::Parse("trailing"))
@@ -1525,17 +1513,19 @@ t "td" 4 "od" { 13 14 }
         // a zero denominator must surface as a parse error rather than panicking in `Div`
         assert!(super::big_rational("1/0 ").is_err());
         assert!(
-            ExtensiveFormGame::try_from_str("EFG 2 R \"\" { \"1\" \"2\" }\nt \"\" 1 { 1/0 2 }\n")
-                .is_err()
+            ExtensiveFormGame::try_from_str(
+                "EFG 2 R \"\" { \"1\" \"2\" }\nt \"\" 1 \"\" { 1/0 2 }\n"
+            )
+            .is_err()
         );
     }
 
     #[test]
-    fn outcome_data_filled_across_nodes() {
-        // an outcome's name and payoffs may be supplied on a later node than where it first appears
+    fn outcome_defined_then_referenced() {
+        // once an outcome is defined, later nodes may reference it by bare id
         let game = "EFG 2 R \"\" { \"1\" \"2\" }
-p \"\" 1 1 \"i\" { \"x\" } 1
-t \"\" 1 \"named\" { 3 4 }
+p \"\" 1 1 \"i\" { \"x\" } 1 \"named\" { 3 4 }
+t \"\" 1
 ";
         assert!(ExtensiveFormGame::try_from_str(game).is_ok());
     }
@@ -1546,7 +1536,7 @@ t \"\" 1 \"named\" { 3 4 }
         assert_eq!(
             validation_err(
                 "EFG 2 R \"\" { \"1\" \"2\" }
-c \"\" 1 \"i\" { \"x\" 1 } 0 { 1 2 }
+c \"\" 1 \"i\" { \"x\" 1 } 0 \"n\" { 1 2 }
 t \"\" 1 { 0 0 }
 "
             ),
@@ -1564,7 +1554,7 @@ t \"\" 1 { 0 0 }
         for _ in 0..depth {
             game.push_str("p \"\" 1 1 \"i\" { \"a\" } 0\n");
         }
-        game.push_str("t \"\" 1 { 0 0 }\n");
+        game.push_str("t \"\" 1 \"\" { 0 0 }\n");
         let parsed = ExtensiveFormGame::try_from_str(&game).unwrap();
         assert!(matches!(parsed.root(), Node::Player(_)));
         // dropping the deep tree is itself a flat pass over the arena
@@ -1574,8 +1564,9 @@ t \"\" 1 { 0 0 }
     #[test]
     fn tolerates_flexible_whitespace() {
         // whitespace is not significant: braces need no padding, and payoff commas need no space
-        let game = ExtensiveFormGame::try_from_str("EFG 2 R \"\" {\"1\" \"2\"}\nt \"\" 1 {1,2}\n")
-            .unwrap();
+        let game =
+            ExtensiveFormGame::try_from_str("EFG 2 R \"\" {\"1\" \"2\"}\nt \"\" 1 \"\" {1,2}\n")
+                .unwrap();
         assert_eq!(game.player_names().len(), 2);
         let Node::Terminal(root) = game.root() else {
             panic!("expected a terminal root");
@@ -1589,8 +1580,10 @@ t \"\" 1 { 0 0 }
         assert_eq!(payoffs, ["1", "2"]);
         // a comma padded with spaces is equally acceptable
         assert!(
-            ExtensiveFormGame::try_from_str("EFG 2 R \"\" { \"1\" \"2\" }\nt \"\" 1 { 1 , 2 }\n")
-                .is_ok()
+            ExtensiveFormGame::try_from_str(
+                "EFG 2 R \"\" { \"1\" \"2\" }\nt \"\" 1 \"\" { 1 , 2 }\n"
+            )
+            .is_ok()
         );
     }
 
@@ -1599,8 +1592,8 @@ t \"\" 1 { 0 0 }
         // a chance node may carry an outcome name (Gambit writes and reads one)
         let game_str = "EFG 2 R \"\" { \"1\" \"2\" }
 c \"\" 1 \"i\" { \"a\" 1/2 \"b\" 1/2 } 1 \"oname\" { 3 4 }
-t \"\" 1 { 3 4 }
-t \"\" 1 { 3 4 }
+t \"\" 1
+t \"\" 1
 ";
         let game = ExtensiveFormGame::try_from_str(game_str).unwrap();
         let Node::Chance(root) = game.root() else {
@@ -1620,7 +1613,7 @@ t \"\" 1 { 3 4 }
         let game_str = "EFG 2 R \"\" { \"1\" \"2\" }
 p \"\" 1 1 \"i\" { \"L\" \"M\" \"R\" } 0
 t \"a\" 0
-t \"b\" 1 { 3 4 }
+t \"b\" 1 \"obname\" { 3 4 }
 t \"c\" 1
 ";
         let game = ExtensiveFormGame::try_from_str(game_str).unwrap();
@@ -1630,14 +1623,23 @@ t \"c\" 1
         let Some(Node::Terminal(null_term)) = root.action(EscapedStr::new("L")) else {
             panic!("expected a terminal after action L");
         };
+        // the null outcome resolves to no payoffs and no name
         assert_eq!(null_term.outcome(), 0);
         assert!(null_term.outcome_payoffs().is_none());
+        assert!(null_term.outcome_name().is_none());
         let Some(Node::Terminal(referenced)) = root.action(EscapedStr::new("R")) else {
             panic!("expected a terminal after action R");
         };
+        // the referencing terminal resolves through the shared outcome to the payoffs "b" defined
         assert_eq!(referenced.outcome(), 1);
-        assert!(referenced.outcome_payoffs().is_none());
-        // the omission is preserved through a Display round-trip
+        let payoffs: Vec<_> = referenced
+            .outcome_payoffs()
+            .unwrap()
+            .iter()
+            .map(BigRational::to_string)
+            .collect();
+        assert_eq!(payoffs, ["3", "4"]);
+        // and the game round-trips
         let written = game.to_string();
         let reparsed = ExtensiveFormGame::try_from_str(written.as_str()).unwrap();
         assert_eq!(game, reparsed);
