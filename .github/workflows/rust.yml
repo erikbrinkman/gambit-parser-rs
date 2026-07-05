@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
     - name: Install llvm-tools-preview
       run: rustup component add llvm-tools-preview
     - uses: Swatinem/rust-cache@v2
