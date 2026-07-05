@@ -508,7 +508,7 @@ impl<'a, 'g> Chance<'a, 'g> {
 
     /// The name of the outcome
     ///
-    /// `None` for the null (0) outcome or an outcome with no name.
+    /// `None` for the null (0) outcome.
     #[must_use]
     pub fn outcome_name(self) -> Option<&'a EscapedStr> {
         self.game.outcome_name(self.raw.outcome)
@@ -609,7 +609,7 @@ impl<'a, 'g> Player<'a, 'g> {
 
     /// The name of the outcome
     ///
-    /// `None` for the null (0) outcome or an outcome with no name.
+    /// `None` for the null (0) outcome.
     #[must_use]
     pub fn outcome_name(self) -> Option<&'a EscapedStr> {
         self.game.outcome_name(self.raw.outcome)
@@ -648,7 +648,7 @@ impl<'a, 'g> Terminal<'a, 'g> {
 
     /// The name of this outcome
     ///
-    /// `None` for the null (0) outcome or an outcome with no name.
+    /// `None` for the null (0) outcome.
     #[must_use]
     pub fn outcome_name(self) -> Option<&'a EscapedStr> {
         self.game.outcome_name(self.raw.outcome)
