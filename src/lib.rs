@@ -472,11 +472,12 @@ impl<'a, 'g> Chance<'a, 'g> {
 
     /// The probability and child for the action with the given label
     ///
-    /// Labels need not be unique within an infoset, so this returns the first match.
+    /// `label` is matched against the unescaped form of each action's label. Labels need not be
+    /// unique within an infoset, so this returns the first match.
     #[must_use]
-    pub fn action(self, label: &EscapedStr) -> Option<(&'g BigRational, Node<'a, 'g>)> {
+    pub fn action(self, label: &str) -> Option<(&'g BigRational, Node<'a, 'g>)> {
         self.actions()
-            .find(|(name, _, _)| *name == label)
+            .find(|(name, _, _)| name.unescape().eq(label.chars()))
             .map(|(_, prob, next)| (prob, next))
     }
 
@@ -575,11 +576,12 @@ impl<'a, 'g> Player<'a, 'g> {
 
     /// The child reached by the action with the given label
     ///
-    /// Labels need not be unique within an infoset, so this returns the first match.
+    /// `label` is matched against the unescaped form of each action's label. Labels need not be
+    /// unique within an infoset, so this returns the first match.
     #[must_use]
-    pub fn action(self, label: &EscapedStr) -> Option<Node<'a, 'g>> {
+    pub fn action(self, label: &str) -> Option<Node<'a, 'g>> {
         self.actions()
-            .find(|(name, _)| *name == label)
+            .find(|(name, _)| name.unescape().eq(label.chars()))
             .map(|(_, next)| next)
     }
 
@@ -1219,7 +1221,7 @@ t "tr" 2 "o2" { 3 4 }
         let labels: Vec<_> = root.actions().map(|(label, _)| label.escape()).collect();
         assert_eq!(labels, ["L", "R"]);
 
-        let Some(Node::Terminal(left)) = root.action(EscapedStr::new("L")) else {
+        let Some(Node::Terminal(left)) = root.action("L") else {
             panic!("expected a terminal after action L");
         };
         assert_eq!(left.name().escape(), "tl");
@@ -1245,7 +1247,7 @@ t \"\" 1 \"\" { 0 0 }
         let Node::Chance(root) = parsed.root() else {
             panic!("expected a chance root");
         };
-        let (prob, _) = root.action(EscapedStr::new("x")).unwrap();
+        let (prob, _) = root.action("x").unwrap();
         assert_eq!(prob.to_string(), "9/10");
     }
 
@@ -1413,7 +1415,7 @@ t \"\" 3 \"\" { 0 0 }
         let Node::Player(root) = game.root() else {
             panic!("expected a player root");
         };
-        let Some(Node::Player(omitted)) = root.action(EscapedStr::new("R")) else {
+        let Some(Node::Player(omitted)) = root.action("R") else {
             panic!("expected a player after action R");
         };
         // the omitted node inherits the declared label and actions
@@ -1466,8 +1468,8 @@ t "td" 4 "od" { 13 14 }
         assert_eq!(chance_labels, ["a", "b"]);
         assert!(chance.action_at(0).is_some());
         assert!(chance.action_at(2).is_none());
-        assert!(chance.action(EscapedStr::new("none")).is_none());
-        let (prob, first_child) = chance.action(EscapedStr::new("a")).unwrap();
+        assert!(chance.action("none").is_none());
+        let (prob, first_child) = chance.action("a").unwrap();
         assert_eq!(prob.to_string(), "1/2");
 
         let Node::Player(player) = first_child else {
@@ -1489,8 +1491,8 @@ t "td" 4 "od" { 13 14 }
         assert_eq!(player_payoffs, ["3", "4"]);
         let player_labels: Vec<_> = player.actions().map(|(label, _)| label.escape()).collect();
         assert_eq!(player_labels, ["x", "y"]);
-        assert!(player.action(EscapedStr::new("none")).is_none());
-        assert!(player.action(EscapedStr::new("y")).is_some());
+        assert!(player.action("none").is_none());
+        assert!(player.action("y").is_some());
         let (label, leaf) = player.action_at(0).unwrap();
         assert_eq!(label.escape(), "x");
         assert!(player.action_at(2).is_none());
@@ -1674,14 +1676,14 @@ t \"c\" 1
         let Node::Player(root) = game.root() else {
             panic!("expected a player root");
         };
-        let Some(Node::Terminal(null_term)) = root.action(EscapedStr::new("L")) else {
+        let Some(Node::Terminal(null_term)) = root.action("L") else {
             panic!("expected a terminal after action L");
         };
         // the null outcome resolves to no payoffs and no name
         assert_eq!(null_term.outcome(), 0);
         assert!(null_term.outcome_payoffs().is_none());
         assert!(null_term.outcome_name().is_none());
-        let Some(Node::Terminal(referenced)) = root.action(EscapedStr::new("R")) else {
+        let Some(Node::Terminal(referenced)) = root.action("R") else {
             panic!("expected a terminal after action R");
         };
         // the referencing terminal resolves through the shared outcome to the payoffs "b" defined
