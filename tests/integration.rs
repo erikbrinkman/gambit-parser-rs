@@ -7,7 +7,7 @@ use std::io::{self, Read};
 /// Labels follow Gambit's escaping: `\"` is a literal quote and every other backslash is kept
 #[test]
 fn parses_escaped_labels() {
-    let game_str = r#"EFG 2 R "a \"quoted\" name" { "p\one" "two" } t "" 1 { 1 2 }"#;
+    let game_str = r#"EFG 2 R "a \"quoted\" name" { "p\one" "two" } t "" 1 "" { 1 2 }"#;
     let game: ExtensiveFormGame<'_> = game_str.try_into().unwrap();
 
     // Display gives the real text, `\"` collapsed to `"`
