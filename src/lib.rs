@@ -24,8 +24,8 @@ use nom::{
 use num_bigint::BigInt;
 use num_rational::BigRational;
 use num_traits::Zero;
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 use std::error::Error as StdError;
 use std::fmt::{Display, Error as FmtError, Formatter};
 pub use unescaped::{EscapedStr, Unescaped};
@@ -142,6 +142,14 @@ impl<'a> ExtensiveFormGame<'a> {
         self.wrap(self.root)
     }
 
+    /// Adapt this game for writing in a given [`WriteMode`]; the result implements [`Display`].
+    ///
+    /// Plain `Display` (and `to_string`) uses [`WriteMode::Faithful`].
+    #[must_use]
+    pub fn display<'g>(&'g self, mode: WriteMode) -> GameDisplay<'a, 'g> {
+        GameDisplay { game: self, mode }
+    }
+
     fn wrap<'g>(&'g self, id: NodeId) -> Node<'a, 'g> {
         match &self.nodes[id.0] {
             RawNode::Chance(raw) => Node::Chance(Chance { game: self, raw }),
@@ -163,15 +171,125 @@ impl<'a> ExtensiveFormGame<'a> {
 
 impl Display for ExtensiveFormGame<'_> {
     fn fmt(&self, out: &mut Formatter<'_>) -> Result<(), FmtError> {
-        write!(out, "EFG 2 R \"{}\" {{ ", self.name.escape())?;
-        for name in &self.player_names {
+        self.display(WriteMode::Faithful).fmt(out)
+    }
+}
+
+/// How much of each shared infoset and outcome to write when serializing a game.
+///
+/// Both are declared once and referenced by id, so a given node may or may not repeat the block.
+/// This selects which nodes write it. See [`ExtensiveFormGame::display`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteMode {
+    /// Declare each infoset and outcome only on its first appearance; reference it by id after.
+    Minimal,
+    /// Reproduce the parsed input: write a block exactly where the source node wrote one.
+    Faithful,
+    /// Write every infoset and outcome in full on every node, as Gambit's own writer does.
+    Exhaustive,
+}
+
+/// A [`Display`] adapter that writes a game in a chosen [`WriteMode`], returned by
+/// [`ExtensiveFormGame::display`].
+#[derive(Clone, Copy)]
+pub struct GameDisplay<'a, 'g> {
+    game: &'g ExtensiveFormGame<'a>,
+    mode: WriteMode,
+}
+
+impl GameDisplay<'_, '_> {
+    /// Whether a node should write its outcome's full definition rather than reference it by id
+    fn declares_outcome(self, outcome: u64, declared: bool, seen: &mut HashSet<u64>) -> bool {
+        match self.mode {
+            WriteMode::Minimal => outcome != 0 && seen.insert(outcome),
+            WriteMode::Faithful => declared,
+            WriteMode::Exhaustive => outcome != 0,
+        }
+    }
+}
+
+impl Display for GameDisplay<'_, '_> {
+    fn fmt(&self, out: &mut Formatter<'_>) -> Result<(), FmtError> {
+        let game = self.game;
+        write!(out, "EFG 2 R \"{}\" {{ ", game.name.escape())?;
+        for name in &game.player_names {
             write!(out, "\"{}\" ", name.escape())?;
         }
         writeln!(out, "}}")?;
-        if let Some(comment) = self.comment {
+        if let Some(comment) = game.comment {
             writeln!(out, "\"{}\"", comment.escape())?;
         }
-        writeln!(out, "{}", self.root())
+
+        // Minimal writes each block the first time its id is seen and references it afterward; only
+        // it reads these sets, so reserve their exact block counts for Minimal and leave the other
+        // modes' sets unallocated
+        let mut chance_seen = HashSet::new();
+        let mut player_seen = HashSet::new();
+        let mut outcome_seen = HashSet::new();
+        if self.mode == WriteMode::Minimal {
+            chance_seen.reserve(game.infosets.chance.len());
+            player_seen.reserve(game.infosets.player.iter().map(HashMap::len).sum());
+            outcome_seen.reserve(game.outcomes.len());
+        }
+        let mut stack = vec![game.root];
+        while let Some(id) = stack.pop() {
+            match &game.nodes[id.0] {
+                RawNode::Chance(raw) => {
+                    write!(out, "\nc \"{}\" {}", raw.name.escape(), raw.infoset)?;
+                    let block = match self.mode {
+                        WriteMode::Minimal => chance_seen.insert(raw.infoset),
+                        WriteMode::Faithful => raw.declared,
+                        WriteMode::Exhaustive => true,
+                    };
+                    if block {
+                        let (label, actions) = &game.infosets.chance[&raw.infoset];
+                        write!(out, " \"{}\" {{ ", label.escape())?;
+                        for (action, prob) in actions {
+                            write!(out, "\"{}\" {} ", action.escape(), prob)?;
+                        }
+                        write!(out, "}}")?;
+                    }
+                    let declared =
+                        self.declares_outcome(raw.outcome, raw.outcome_declared, &mut outcome_seen);
+                    write_outcome(out, game, raw.outcome, declared)?;
+                    stack.extend(raw.children.iter().rev().copied());
+                }
+                RawNode::Player(raw) => {
+                    write!(
+                        out,
+                        "\np \"{}\" {} {}",
+                        raw.name.escape(),
+                        raw.player_num,
+                        raw.infoset
+                    )?;
+                    let block = match self.mode {
+                        WriteMode::Minimal => player_seen.insert((raw.player_num, raw.infoset)),
+                        WriteMode::Faithful => raw.declared,
+                        WriteMode::Exhaustive => true,
+                    };
+                    if block {
+                        let (label, actions) =
+                            &game.infosets.player[raw.player_num - 1][&raw.infoset];
+                        write!(out, " \"{}\" {{ ", label.escape())?;
+                        for action in actions {
+                            write!(out, "\"{}\" ", action.escape())?;
+                        }
+                        write!(out, "}}")?;
+                    }
+                    let declared =
+                        self.declares_outcome(raw.outcome, raw.outcome_declared, &mut outcome_seen);
+                    write_outcome(out, game, raw.outcome, declared)?;
+                    stack.extend(raw.children.iter().rev().copied());
+                }
+                RawNode::Terminal(raw) => {
+                    write!(out, "\nt \"{}\"", raw.name.escape())?;
+                    let declared =
+                        self.declares_outcome(raw.outcome, raw.outcome_declared, &mut outcome_seen);
+                    write_outcome(out, game, raw.outcome, declared)?;
+                }
+            }
+        }
+        writeln!(out)
     }
 }
 
@@ -281,40 +399,6 @@ pub enum Node<'a, 'g> {
     Player(Player<'a, 'g>),
     /// A terminal node
     Terminal(Terminal<'a, 'g>),
-}
-
-impl Display for Node<'_, '_> {
-    fn fmt(&self, out: &mut Formatter<'_>) -> Result<(), FmtError> {
-        let mut queue = vec![*self];
-        while let Some(node) = queue.pop() {
-            match node {
-                Node::Chance(chance) => {
-                    queue.extend(
-                        chance
-                            .raw
-                            .children
-                            .iter()
-                            .rev()
-                            .map(|&child| chance.game.wrap(child)),
-                    );
-                    write!(out, "\nc {chance}")?;
-                }
-                Node::Player(player) => {
-                    queue.extend(
-                        player
-                            .raw
-                            .children
-                            .iter()
-                            .rev()
-                            .map(|&child| player.game.wrap(child)),
-                    );
-                    write!(out, "\np {player}")?;
-                }
-                Node::Terminal(terminal) => write!(out, "\nt {terminal}")?,
-            }
-        }
-        Ok(())
-    }
 }
 
 /// Write a node's outcome: always the id, plus the name and payoffs when this node declared them
@@ -439,22 +523,6 @@ impl<'a, 'g> Chance<'a, 'g> {
     }
 }
 
-impl Display for Chance<'_, '_> {
-    fn fmt(&self, out: &mut Formatter<'_>) -> Result<(), FmtError> {
-        write!(out, "\"{}\" {}", self.raw.name.escape(), self.raw.infoset)?;
-        // the label and action list are written together, or both omitted, matching the file
-        if self.raw.declared {
-            let (label, actions) = self.entry();
-            write!(out, " \"{}\" {{ ", label.escape())?;
-            for (action, prob) in actions {
-                write!(out, "\"{}\" {} ", action.escape(), prob)?;
-            }
-            write!(out, "}}")?;
-        }
-        write_outcome(out, self.game, self.raw.outcome, self.raw.outcome_declared)
-    }
-}
-
 /// A player node in the game tree
 ///
 /// A player node represents a place where one of the players chooses what happens next.
@@ -554,28 +622,6 @@ impl<'a, 'g> Player<'a, 'g> {
     }
 }
 
-impl Display for Player<'_, '_> {
-    fn fmt(&self, out: &mut Formatter<'_>) -> Result<(), FmtError> {
-        write!(
-            out,
-            "\"{}\" {} {}",
-            self.raw.name.escape(),
-            self.raw.player_num,
-            self.raw.infoset
-        )?;
-        // the label and action list are written together, or both omitted, matching the file
-        if self.raw.declared {
-            let (label, actions) = self.entry();
-            write!(out, " \"{}\" {{ ", label.escape())?;
-            for action in actions {
-                write!(out, "\"{}\" ", action.escape())?;
-            }
-            write!(out, "}}")?;
-        }
-        write_outcome(out, self.game, self.raw.outcome, self.raw.outcome_declared)
-    }
-}
-
 /// A terminal node represents the end of a game
 ///
 /// Terminal nodes simply assign payoffs to every player in the game
@@ -612,13 +658,6 @@ impl<'a, 'g> Terminal<'a, 'g> {
     #[must_use]
     pub fn outcome_payoffs(self) -> Option<&'g [BigRational]> {
         self.game.outcome_payoffs(self.raw.outcome)
-    }
-}
-
-impl Display for Terminal<'_, '_> {
-    fn fmt(&self, out: &mut Formatter<'_>) -> Result<(), FmtError> {
-        write!(out, "\"{}\"", self.raw.name.escape())?;
-        write_outcome(out, self.game, self.raw.outcome, self.raw.outcome_declared)
     }
 }
 
@@ -1044,7 +1083,7 @@ fn parse_game(input: &str) -> Result<(&str, ExtensiveFormGame<'_>), Error<'_>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Error, EscapedStr, ExtensiveFormGame, Node, ValidationError};
+    use super::{Error, EscapedStr, ExtensiveFormGame, Node, ValidationError, WriteMode};
     use num_rational::BigRational;
     use num_traits::One;
 
@@ -1643,5 +1682,47 @@ t \"c\" 1
         let written = game.to_string();
         let reparsed = ExtensiveFormGame::try_from_str(written.as_str()).unwrap();
         assert_eq!(game, reparsed);
+    }
+
+    #[test]
+    fn write_modes() {
+        // infoset 1 and outcome 1 are each declared more than minimally (root+mid repeat the
+        // infoset block, "a"+"b" repeat the outcome), and "c" references the outcome by id
+        let input = "EFG 2 R \"\" { \"1\" \"2\" }
+p \"root\" 1 1 \"iset\" { \"L\" \"R\" } 0
+p \"mid\" 1 1 \"iset\" { \"L\" \"R\" } 0
+t \"a\" 1 \"out\" { 1 2 }
+t \"b\" 1 \"out\" { 1 2 }
+t \"c\" 1
+";
+        let game = ExtensiveFormGame::try_from_str(input).unwrap();
+
+        // Display defaults to Faithful, which reproduces the parsed declare/reference structure
+        assert_eq!(
+            game.to_string(),
+            game.display(WriteMode::Faithful).to_string()
+        );
+        let faithful = game.display(WriteMode::Faithful).to_string();
+        assert_eq!(ExtensiveFormGame::try_from_str(&faithful).unwrap(), game);
+
+        // every mode is valid and resolves to the same game, so its exhaustive rendering matches
+        let canonical = game.display(WriteMode::Exhaustive).to_string();
+        for mode in [
+            WriteMode::Minimal,
+            WriteMode::Faithful,
+            WriteMode::Exhaustive,
+        ] {
+            let out = game.display(mode).to_string();
+            let reparsed = ExtensiveFormGame::try_from_str(&out).unwrap();
+            assert_eq!(
+                reparsed.display(WriteMode::Exhaustive).to_string(),
+                canonical
+            );
+        }
+
+        // Minimal declares each block once; Exhaustive writes them on every node
+        let minimal = game.display(WriteMode::Minimal).to_string();
+        assert!(minimal.len() < faithful.len());
+        assert!(faithful.len() < canonical.len());
     }
 }
