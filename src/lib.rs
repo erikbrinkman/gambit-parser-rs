@@ -670,6 +670,9 @@ fn fail(input: &str) -> nom::Err<nom::error::Error<&str>> {
     nom::Err::Error(nom::error::Error::new(input, ErrorKind::Fail))
 }
 
+/// The largest exponent magnitude accepted, bounding the cost of the exact `10^exp` below.
+const MAX_ABS_EXPONENT: i32 = 10_000;
+
 fn big_float(input: &str) -> IResult<&str, BigRational> {
     let (res_input, (main_neg, (int, dec), exp)) = (
         negate,
@@ -694,6 +697,9 @@ fn big_float(input: &str) -> IResult<&str, BigRational> {
     }
     if let Some((neg, exp)) = exp {
         let exp: i32 = exp.parse().map_err(|_| fail(input))?;
+        if exp > MAX_ABS_EXPONENT {
+            return Err(fail(input));
+        }
         res *= BigRational::from_integer(10.into()).pow(if neg { -exp } else { exp });
     }
     if main_neg {
@@ -1545,6 +1551,15 @@ t "td" 4 "od" { 13 14 }
     fn rejects_overflowing_exponent() {
         // an exponent that doesn't fit an i32 fails the number parse
         assert!(super::big_float("1e99999999999 ").is_err());
+    }
+
+    #[test]
+    fn rejects_huge_exponent() {
+        // a huge but i32-valid exponent is capped, not materialized
+        assert!(super::big_float("1e2000000000 ").is_err());
+        assert!(super::big_float("1e-2000000000 ").is_err());
+        // an exponent within the cap still parses
+        assert!(super::big_float("1e100 ").is_ok());
     }
 
     #[test]
