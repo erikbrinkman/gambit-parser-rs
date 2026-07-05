@@ -44,6 +44,10 @@ struct Infosets<'a> {
     chance: HashMap<u64, ChanceInfoset<'a>>,
 }
 
+/// An index into the game's flat node arena ([`ExtensiveFormGame`]'s `nodes`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NodeId(usize);
+
 /// A node in the raw, id-referenced game tree. Infoset payloads live on the game, not here.
 #[derive(Debug, PartialEq, Clone)]
 enum RawNode<'a> {
@@ -58,7 +62,7 @@ struct RawChance<'a> {
     infoset: u64,
     // did THIS node write the infoset block, or inherit it by omission?
     declared: bool,
-    children: Box<[RawNode<'a>]>,
+    children: Box<[NodeId]>,
     outcome: u64,
     outcome_name: Option<&'a EscapedStr>,
     outcome_payoffs: Option<Box<[BigRational]>>,
@@ -71,7 +75,7 @@ struct RawPlayer<'a> {
     infoset: u64,
     // did THIS node write the infoset block, or inherit it by omission?
     declared: bool,
-    children: Box<[RawNode<'a>]>,
+    children: Box<[NodeId]>,
     outcome: u64,
     outcome_name: Option<&'a EscapedStr>,
     outcome_payoffs: Option<Box<[BigRational]>>,
@@ -104,7 +108,9 @@ pub struct ExtensiveFormGame<'a> {
     player_names: Box<[&'a EscapedStr]>,
     comment: Option<&'a EscapedStr>,
     infosets: Infosets<'a>,
-    root: RawNode<'a>,
+    // every node in the tree, stored flat; children reference each other by arena index
+    nodes: Box<[RawNode<'a>]>,
+    root: NodeId,
 }
 
 impl<'a> ExtensiveFormGame<'a> {
@@ -129,11 +135,11 @@ impl<'a> ExtensiveFormGame<'a> {
     /// The root node of the game tree
     #[must_use]
     pub fn root<'g>(&'g self) -> Node<'a, 'g> {
-        self.wrap(&self.root)
+        self.wrap(self.root)
     }
 
-    fn wrap<'g>(&'g self, raw: &'g RawNode<'a>) -> Node<'a, 'g> {
-        match raw {
+    fn wrap<'g>(&'g self, id: NodeId) -> Node<'a, 'g> {
+        match &self.nodes[id.0] {
             RawNode::Chance(raw) => Node::Chance(Chance { game: self, raw }),
             RawNode::Player(raw) => Node::Player(Player { game: self, raw }),
             RawNode::Terminal(raw) => Node::Terminal(Terminal { raw }),
@@ -254,36 +260,28 @@ impl<'a> ExtensiveFormGame<'a> {
             }
         }
 
+        // every parsed node lives in the arena, so a flat pass visits the whole tree
         let mut outcomes = HashMap::new();
-        let mut queue = vec![&self.root];
-        while let Some(node) = queue.pop() {
+        for node in &self.nodes {
             match node {
-                RawNode::Chance(chance) => {
-                    self.validate_outcome(
-                        chance.outcome,
-                        chance.outcome_name,
-                        chance.outcome_payoffs.as_deref(),
-                        &mut outcomes,
-                    )?;
-                    queue.extend(chance.children.iter());
-                }
-                RawNode::Player(player) => {
-                    self.validate_outcome(
-                        player.outcome,
-                        player.outcome_name,
-                        player.outcome_payoffs.as_deref(),
-                        &mut outcomes,
-                    )?;
-                    queue.extend(player.children.iter());
-                }
-                RawNode::Terminal(term) => {
-                    self.validate_outcome(
-                        term.outcome,
-                        term.outcome_name,
-                        term.outcome_payoffs.as_deref(),
-                        &mut outcomes,
-                    )?;
-                }
+                RawNode::Chance(chance) => self.validate_outcome(
+                    chance.outcome,
+                    chance.outcome_name,
+                    chance.outcome_payoffs.as_deref(),
+                    &mut outcomes,
+                )?,
+                RawNode::Player(player) => self.validate_outcome(
+                    player.outcome,
+                    player.outcome_name,
+                    player.outcome_payoffs.as_deref(),
+                    &mut outcomes,
+                )?,
+                RawNode::Terminal(term) => self.validate_outcome(
+                    term.outcome,
+                    term.outcome_name,
+                    term.outcome_payoffs.as_deref(),
+                    &mut outcomes,
+                )?,
             }
         }
 
@@ -381,7 +379,7 @@ impl Display for Node<'_, '_> {
                             .children
                             .iter()
                             .rev()
-                            .map(|c| chance.game.wrap(c)),
+                            .map(|&child| chance.game.wrap(child)),
                     );
                     write!(out, "\nc {chance}")?;
                 }
@@ -392,7 +390,7 @@ impl Display for Node<'_, '_> {
                             .children
                             .iter()
                             .rev()
-                            .map(|c| player.game.wrap(c)),
+                            .map(|&child| player.game.wrap(child)),
                     );
                     write!(out, "\np {player}")?;
                 }
@@ -445,7 +443,7 @@ impl<'a, 'g> Chance<'a, 'g> {
         actions
             .iter()
             .zip(self.raw.children.iter())
-            .map(move |((label, prob), child)| (*label, prob, game.wrap(child)))
+            .map(move |((label, prob), &child)| (*label, prob, game.wrap(child)))
     }
 
     /// The probability and child for the action with the given label
@@ -473,7 +471,8 @@ impl<'a, 'g> Chance<'a, 'g> {
     ) -> Option<(&'a EscapedStr, &'g BigRational, Node<'a, 'g>)> {
         let (_, actions) = self.entry();
         let (label, prob) = actions.get(index)?;
-        Some((*label, prob, self.game.wrap(self.raw.children.get(index)?)))
+        let &child = self.raw.children.get(index)?;
+        Some((*label, prob, self.game.wrap(child)))
     }
 
     /// The outcome id
@@ -574,7 +573,7 @@ impl<'a, 'g> Player<'a, 'g> {
         labels
             .iter()
             .zip(self.raw.children.iter())
-            .map(move |(label, child)| (*label, game.wrap(child)))
+            .map(move |(label, &child)| (*label, game.wrap(child)))
     }
 
     /// The child reached by the action with the given label
@@ -599,7 +598,8 @@ impl<'a, 'g> Player<'a, 'g> {
     pub fn action_at(self, index: usize) -> Option<(&'a EscapedStr, Node<'a, 'g>)> {
         let (_, actions) = self.entry();
         let &label = actions.get(index)?;
-        Some((label, self.game.wrap(self.raw.children.get(index)?)))
+        let &child = self.raw.children.get(index)?;
+        Some((label, self.game.wrap(child)))
     }
 
     /// The outcome id
@@ -803,19 +803,26 @@ where
     )
 }
 
-/// Parse `count` child nodes in sequence (they follow a node, one per action)
-fn parse_children<'a>(
-    mut input: &'a str,
-    count: usize,
-    infosets: &mut Infosets<'a>,
-) -> Result<(&'a str, Box<[RawNode<'a>]>), Error<'a>> {
-    let mut children = Vec::with_capacity(count);
-    for _ in 0..count {
-        let (rest, next) = parse_node(input, infosets)?;
-        input = rest;
-        children.push(next);
+/// A parent node whose header is parsed but whose children are still being collected.
+struct PendingNode<'a> {
+    node: RawNode<'a>,
+    child_count: usize,
+    children: Vec<NodeId>,
+}
+
+impl<'a> PendingNode<'a> {
+    fn finish(self) -> RawNode<'a> {
+        let PendingNode {
+            mut node, children, ..
+        } = self;
+        match &mut node {
+            RawNode::Chance(chance) => chance.children = children.into(),
+            RawNode::Player(player) => player.children = children.into(),
+            // only chance and player nodes gather children, so only they are ever pending
+            RawNode::Terminal(_) => unreachable!("terminal nodes are never pending"),
+        }
+        node
     }
-    Ok((input, children.into()))
 }
 
 /// Record or check an infoset declaration, returning whether the block was written here and the
@@ -853,33 +860,77 @@ fn resolve_infoset<'a, A: PartialEq>(
     }
 }
 
-fn parse_node<'a>(
-    input: &'a str,
+/// Parse the whole game tree into a flat arena, returning the nodes and the root's id.
+fn parse_tree<'a>(
+    mut input: &'a str,
     infosets: &mut Infosets<'a>,
-) -> Result<(&'a str, RawNode<'a>), Error<'a>> {
-    let (input, style) = preceded(multispace1, one_of("cpt")).parse(input)?;
-    match style {
-        'c' => {
-            let (input, chance) = parse_chance(input, infosets)?;
-            Ok((input, RawNode::Chance(chance)))
+) -> Result<(&'a str, Box<[RawNode<'a>]>, NodeId), Error<'a>> {
+    // finished nodes, in the post-order they complete (every child precedes its parent)
+    let mut nodes: Vec<RawNode<'a>> = Vec::new();
+    // parents still gathering their children
+    let mut stack: Vec<PendingNode<'a>> = Vec::new();
+
+    loop {
+        let (rest, style) = preceded(multispace1, one_of("cpt")).parse(input)?;
+        input = rest;
+        // a chance or player node opens a frame; a terminal completes immediately
+        let mut completed = match style {
+            'c' => {
+                let (rest, chance, child_count) = parse_chance(input, infosets)?;
+                input = rest;
+                stack.push(PendingNode {
+                    node: RawNode::Chance(chance),
+                    child_count,
+                    children: Vec::with_capacity(child_count),
+                });
+                continue;
+            }
+            'p' => {
+                let (rest, player, child_count) = parse_player(input, infosets)?;
+                input = rest;
+                stack.push(PendingNode {
+                    node: RawNode::Player(player),
+                    child_count,
+                    children: Vec::with_capacity(child_count),
+                });
+                continue;
+            }
+            't' => {
+                let (rest, term) = parse_terminal(input)?;
+                input = rest;
+                push_node(&mut nodes, RawNode::Terminal(term))
+            }
+            // `one_of("cpt")` only ever yields one of these three characters
+            _ => unreachable!(),
+        };
+
+        // attach the finished node to its waiting parent, finishing parents that fill up in turn
+        loop {
+            let Some(pending) = stack.last_mut() else {
+                // nothing is waiting, so this node is the root and the tree is complete
+                return Ok((input, nodes.into(), completed));
+            };
+            pending.children.push(completed);
+            if pending.children.len() < pending.child_count {
+                break;
+            }
+            completed = push_node(&mut nodes, stack.pop().unwrap().finish());
         }
-        'p' => {
-            let (input, player) = parse_player(input, infosets)?;
-            Ok((input, RawNode::Player(player)))
-        }
-        't' => {
-            let (input, term) = parse_terminal(input)?;
-            Ok((input, RawNode::Terminal(term)))
-        }
-        // `one_of("cpt")` only ever yields one of these three characters
-        _ => unreachable!(),
     }
 }
 
+/// Append a finished node to the arena and return its id
+fn push_node<'a>(nodes: &mut Vec<RawNode<'a>>, node: RawNode<'a>) -> NodeId {
+    let id = NodeId(nodes.len());
+    nodes.push(node);
+    id
+}
+
+/// Parse a chance node's header, returning the node (children still empty) and its child count
 fn parse_chance<'a>(
     input: &'a str,
     infosets: &mut Infosets<'a>,
-) -> Result<(&'a str, RawChance<'a>), Error<'a>> {
+) -> Result<(&'a str, RawChance<'a>, usize), Error<'a>> {
     let (input, (name, infoset, declared, outcome, outcome_name, outcome_payoffs)) = (
         preceded(multispace1, label),
         preceded(multispace1, u64),
@@ -898,25 +949,27 @@ fn parse_chance<'a>(
     )
         .parse(input)?;
     let (declared, child_count) = resolve_infoset(&mut infosets.chance, infoset, declared)?;
-    let (input, children) = parse_children(input, child_count, infosets)?;
     Ok((
         input,
         RawChance {
             name,
             infoset,
             declared,
-            children,
+            // filled once the following child nodes are parsed (see PendingNode::finish)
+            children: Box::default(),
             outcome,
             outcome_name,
             outcome_payoffs: outcome_payoffs.map(Into::into),
         },
+        child_count,
     ))
 }
 
+/// Parse a player node's header, returning the node (children still empty) and its child count
 fn parse_player<'a>(
     input: &'a str,
     infosets: &mut Infosets<'a>,
-) -> Result<(&'a str, RawPlayer<'a>), Error<'a>> {
+) -> Result<(&'a str, RawPlayer<'a>, usize), Error<'a>> {
     let (input, (name, player_num, infoset, declared, outcome, outcome_name, outcome_payoffs)) = (
         preceded(multispace1, label),
         preceded(multispace1, u64),
@@ -937,7 +990,6 @@ fn parse_player<'a>(
     }
     let (declared, child_count) =
         resolve_infoset(&mut infosets.player[player_num - 1], infoset, declared)?;
-    let (input, children) = parse_children(input, child_count, infosets)?;
     Ok((
         input,
         RawPlayer {
@@ -945,11 +997,13 @@ fn parse_player<'a>(
             player_num,
             infoset,
             declared,
-            children,
+            // filled once the following child nodes are parsed (see PendingNode::finish)
+            children: Box::default(),
             outcome,
             outcome_name,
             outcome_payoffs: outcome_payoffs.map(Into::into),
         },
+        child_count,
     ))
 }
 
@@ -997,7 +1051,7 @@ fn parse_game(input: &str) -> Result<(&str, ExtensiveFormGame<'_>), Error<'_>> {
         player: (0..num_players).map(|_| HashMap::new()).collect(),
         chance: HashMap::new(),
     };
-    let (input, root) = parse_node(input, &mut infosets)?;
+    let (input, nodes, root) = parse_tree(input, &mut infosets)?;
     Ok((
         input,
         ExtensiveFormGame {
@@ -1005,6 +1059,7 @@ fn parse_game(input: &str) -> Result<(&str, ExtensiveFormGame<'_>), Error<'_>> {
             player_names: player_names.into(),
             comment,
             infosets,
+            nodes,
             root,
         },
     ))
@@ -1505,6 +1560,23 @@ t \"\" 1 { 0 0 }
             ),
             ValidationError::NullOutcomePayoffs
         );
+    }
+
+    #[test]
+    fn deep_tree_parses_and_drops() {
+        // a tree far deeper than any call stack could hold must parse, validate, navigate, and drop
+        // without overflowing, now that the arena makes every path flat rather than recursive
+        let depth = 200_000;
+        let mut game = String::with_capacity(depth * 24 + 64);
+        game.push_str("EFG 2 R \"\" { \"1\" \"2\" }\n");
+        for _ in 0..depth {
+            game.push_str("p \"\" 1 1 \"i\" { \"a\" } 0\n");
+        }
+        game.push_str("t \"\" 1 { 0 0 }\n");
+        let parsed = ExtensiveFormGame::try_from_str(&game).unwrap();
+        assert!(matches!(parsed.root(), Node::Player(_)));
+        // dropping the deep tree is itself a flat pass over the arena
+        drop(parsed);
     }
 
     #[test]
