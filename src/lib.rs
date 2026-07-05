@@ -785,9 +785,9 @@ where
     E: ParseError<&'a str>,
 {
     delimited(
-        pair(char('{'), multispace1),
+        pair(char('{'), multispace0),
         separated_list1(multispace1, f),
-        pair(multispace1, char('}')),
+        pair(multispace0, char('}')),
     )
 }
 
@@ -797,9 +797,9 @@ where
     E: ParseError<&'a str>,
 {
     delimited(
-        pair(char('{'), multispace1),
-        separated_list1(pair(opt(char(',')), multispace1), f),
-        pair(multispace1, char('}')),
+        pair(char('{'), multispace0),
+        separated_list1((multispace0, opt(char(',')), multispace0), f),
+        pair(multispace0, char('}')),
     )
 }
 
@@ -1504,6 +1504,29 @@ t \"\" 1 { 0 0 }
 "
             ),
             ValidationError::NullOutcomePayoffs
+        );
+    }
+
+    #[test]
+    fn tolerates_flexible_whitespace() {
+        // whitespace is not significant: braces need no padding, and payoff commas need no space
+        let game = ExtensiveFormGame::try_from_str("EFG 2 R \"\" {\"1\" \"2\"}\nt \"\" 1 {1,2}\n")
+            .unwrap();
+        assert_eq!(game.player_names().len(), 2);
+        let Node::Terminal(root) = game.root() else {
+            panic!("expected a terminal root");
+        };
+        let payoffs: Vec<_> = root
+            .outcome_payoffs()
+            .unwrap()
+            .iter()
+            .map(BigRational::to_string)
+            .collect();
+        assert_eq!(payoffs, ["1", "2"]);
+        // a comma padded with spaces is equally acceptable
+        assert!(
+            ExtensiveFormGame::try_from_str("EFG 2 R \"\" { \"1\" \"2\" }\nt \"\" 1 { 1 , 2 }\n")
+                .is_ok()
         );
     }
 
