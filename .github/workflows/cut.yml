@@ -31,7 +31,7 @@ jobs:
         with:
           ref: main # the branch tip, not the dispatch SHA
           fetch-depth: 0
-      - uses: taiki-e/install-action@v2.87.1
+      - uses: taiki-e/install-action@v2.87.21
         with:
           tool: cargo-release
       - name: Bump, tag, and trigger release
